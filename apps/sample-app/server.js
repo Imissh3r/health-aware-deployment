@@ -5,6 +5,27 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const VERSION = process.env.APP_VERSION || '1.0.0';
 
+// Testing response delay failures
+function readNonNegativeInt(name) {
+  const raw = process.env[name];
+  if (raw === undefined) return 0;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    console.error(`${name} must be a non-negative integer (got "${raw}")`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const ERROR_EVERY_N_REQUESTS =
+  readNonNegativeInt('ERROR_EVERY_N_REQUESTS');
+
+const RESPONSE_DELAY_MS =
+  readNonNegativeInt('RESPONSE_DELAY_MS');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // root endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -23,24 +44,14 @@ app.get('/ready', (req, res) => {
   res.status(200).json({ status: 'ready' });
 });
 
-// Testing deterministic failure under /api/work endpoint
-const ERROR_EVERY_N_REQUESTS = Number(
-  process.env.ERROR_EVERY_N_REQUESTS ?? 0
-);
-
-if (
-  !Number.isInteger(ERROR_EVERY_N_REQUESTS) ||
-  ERROR_EVERY_N_REQUESTS < 0
-) {
-  throw new Error(
-    'ERROR_EVERY_N_REQUESTS must be a non-negative integer'
-  );
-}
-
 let workRequestCount = 0;
 
-app.get('/api/work', (req, res) => {
+app.get('/api/work', async (req, res) => {
   workRequestCount += 1;
+
+  if (RESPONSE_DELAY_MS > 0) {
+    await sleep(RESPONSE_DELAY_MS);
+  }
 
   if (
     ERROR_EVERY_N_REQUESTS > 0 &&
