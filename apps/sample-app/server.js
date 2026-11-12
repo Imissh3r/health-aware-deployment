@@ -1,4 +1,5 @@
 import express from 'express';
+import { pool } from './db.js';
 
 const app = express();
 
@@ -39,9 +40,22 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-// ready endpoint
-app.get('/ready', (req, res) => {
-  res.status(200).json({ status: 'ready' });
+// Readiness check: verify database connectivity
+app.get('/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+
+    res.status(200).json({
+      status: 'ready'
+    });
+  } catch (error) {
+    console.error('Database readiness check failed:', error.message);
+
+    res.status(503).json({
+      status: 'not_ready',
+      reason: 'database_unavailable'
+    });
+  }
 });
 
 let workRequestCount = 0;
@@ -79,9 +93,17 @@ const server = app.listen(PORT, () => {
 function shutdown(signal) {
   console.log(`${signal} received, shutting down`);
 
-  server.close(() => {
+  server.close(async () => {
     console.log('HTTP server closed');
-    process.exit(0);
+
+    try {
+      await pool.end();
+      console.log('PostgreSQL connection pool closed');
+      process.exit(0);
+    } catch (error) {
+      console.error('Failed to close PostgreSQL pool:', error.message);
+      process.exit(1);
+    }
   });
 
   // Close idle connections immediately.

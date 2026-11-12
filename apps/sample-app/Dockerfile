@@ -11,7 +11,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Copy application source code
-COPY --chown=node:node server.js ./
+COPY --chown=node:node server.js db.js ./
 
 # Set runtime environment variables
 ENV NODE_ENV=production
