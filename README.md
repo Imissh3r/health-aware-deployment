@@ -71,8 +71,9 @@ controller, CI/CD pipeline, dashboard and the formal comparative experiments.
 The two fault-injection variables must be non-negative integers; invalid values
 make the application exit at startup.
 
-They are not yet passed through `compose.yaml`, so fault injection is disabled
-in the default Compose deployment.
+Both fault-injection variables are passed through Docker Compose and default to
+`0` (disabled). They can be configured through environment variables for local
+testing.
 
 ### Database settings
 
