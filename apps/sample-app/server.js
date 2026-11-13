@@ -79,11 +79,26 @@ app.get('/api/work', async (req, res) => {
     });
   }
 
+
+  try {
+    await pool.query('SELECT 1');
+  } catch (error) {
+    console.error('Workload database query failed:', error.message);
+
+    return res.status(503).json({
+      status: 'error',
+      reason: 'database_unavailable',
+      request: workRequestCount,
+      version: VERSION
+    });
+  }
+
   res.json({
     status: 'ok',
     request: workRequestCount,
     version: VERSION
   });
+
 });
 
 const server = app.listen(PORT, () => {
