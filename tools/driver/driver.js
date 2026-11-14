@@ -1,4 +1,5 @@
 import { parseArgs } from 'node:util';
+import { performance } from 'node:perf_hooks';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -12,6 +13,21 @@ const DEFAULT_OUT = fileURLToPath(
 
 // Sanity guard against typos, not an experimental threshold.
 const MAX_OFFERED = 1_000_000;
+
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT'
+]);
 
 const OPTIONS = {
   url: { type: 'string' },
@@ -71,6 +87,7 @@ function defaultRunId() {
 
 let values;
 let tokens;
+
 try {
   ({ values, tokens } = parseArgs({
     options: OPTIONS,
@@ -86,6 +103,7 @@ const errors = [];
 
 // parseArgs silently keeps the last value of a repeated option; reject it.
 const seen = new Set();
+
 for (const token of tokens) {
   if (token.kind !== 'option') continue;
   if (seen.has(token.name)) {
@@ -95,6 +113,7 @@ for (const token of tokens) {
 }
 
 let url;
+
 if (values.url === undefined) {
   errors.push('--url is required');
 } else {
@@ -113,6 +132,7 @@ const duration = positiveInt('duration', values.duration, 60, errors);
 
 const offered =
   rate === undefined || duration === undefined ? undefined : rate * duration;
+
 if (
   offered !== undefined &&
   (!Number.isSafeInteger(offered) || offered > MAX_OFFERED)
@@ -123,12 +143,14 @@ if (
 }
 
 const timeoutMs = positiveInt('timeout', values.timeout, 3000, errors);
+
 const maxConcurrency = positiveInt(
   'max-concurrency',
   values['max-concurrency'],
   50,
   errors
 );
+
 const maxLateness = positiveNumber(
   'max-lateness',
   values['max-lateness'],
@@ -137,6 +159,7 @@ const maxLateness = positiveNumber(
 );
 
 const warmup = nonNegativeInt('warmup', values.warmup, 5, errors);
+
 if (warmup !== undefined && duration !== undefined && warmup >= duration) {
   errors.push(
     `--warmup (${warmup}) must be less than --duration (${duration}); ` +
@@ -145,8 +168,10 @@ if (warmup !== undefined && duration !== undefined && warmup >= duration) {
 }
 
 const runId = values['run-id'] ?? defaultRunId();
+
 const runIdValid =
   /^[A-Za-z0-9._-]+$/.test(runId) && runId !== '.' && runId !== '..';
+
 if (!runIdValid) {
   errors.push(
     `--run-id may only contain letters, digits, dot, dash and underscore (got "${runId}")`
@@ -154,11 +179,14 @@ if (!runIdValid) {
 }
 
 let outDir = DEFAULT_OUT;
+
 if (values.out !== undefined) {
   if (values.out.trim() === '') errors.push('--out must not be empty');
   else outDir = path.resolve(values.out);
 }
+
 const runDir = path.join(outDir, runId);
+
 if (runIdValid && fs.existsSync(runDir)) {
   errors.push(`run directory already exists, refusing to overwrite: ${runDir}`);
 }
@@ -179,6 +207,170 @@ const config = {
   notes: values.notes ?? ''
 };
 
-console.log('Configuration is valid:');
-console.log(JSON.stringify(config, null, 2));
-console.log('(Skeleton only: nothing was sent and no files were written.)');
+// Stage 3.2 prototype: in-memory observations only; no output files yet.
+async function runPrototype(config) {
+  const periodMs = 1000 / config.rate;
+  const start = performance.now();
+  const observations = new Array(config.offered);
+  const pending = new Set();
+
+  let inFlight = 0;
+
+  for (let i = 0; i < config.offered; i++) {
+    const scheduled = i * periodMs;
+    const deadline = start + scheduled;
+
+    while (performance.now() < deadline) {
+      const remainingMs = deadline - performance.now();
+
+      await new Promise(resolve =>
+        setTimeout(resolve, Math.max(1, Math.ceil(remainingMs)))
+      );
+    }
+
+    const actual = performance.now();
+
+    const record = {
+      seq: i + 1,
+      scheduled_ms: scheduled,
+      dispatched_ms: null,
+      completed_ms: null,
+      dispatch_delay_ms: null,
+      latency_ms: null,
+      outcome: null,
+      http_status: null,
+      error_code: null,
+      miss_reason: null,
+      version: null,
+      warmup: scheduled < config.warmupSeconds * 1000
+    };
+
+    observations[i] = record;
+
+    if (actual - deadline > config.maxLatenessMs) {
+      record.outcome = 'missed';
+      record.miss_reason = 'late';
+      continue;
+    }
+
+    if (inFlight >= config.maxConcurrency) {
+      record.outcome = 'missed';
+      record.miss_reason = 'concurrency';
+      continue;
+    }
+
+    record.dispatched_ms = actual - start;
+    record.dispatch_delay_ms = record.dispatched_ms - scheduled;
+
+    inFlight++;
+
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), config.timeoutMs);
+
+    const task = (async () => {
+      try {
+        const response = await fetch(config.url, {
+          redirect: 'manual',
+          signal: abort.signal
+        });
+
+        record.http_status = response.status;
+
+        const body = await response.text();
+
+        record.outcome =
+          response.status >= 200 && response.status < 300
+            ? 'ok'
+            : 'http_error';
+
+        try {
+          const parsed = JSON.parse(body);
+
+          if (typeof parsed?.version === 'string') {
+            record.version = parsed.version;
+          }
+        } catch {
+          // Not JSON is allowed; version remains null.
+        }
+
+      } catch (error) {
+        const code = error?.cause?.code ?? error?.code;
+
+        if (abort.signal.aborted) {
+          record.outcome = 'timeout';
+        } else if (NETWORK_ERROR_CODES.has(code)) {
+          record.outcome = 'connection_error';
+          record.error_code = code;
+        } else {
+          record.outcome = 'driver_error';
+          record.error_code = code ?? error?.name ?? 'UNKNOWN';
+        }
+
+      } finally {
+        record.completed_ms = performance.now() - start;
+        record.latency_ms =
+          record.completed_ms - record.dispatched_ms;
+
+        clearTimeout(timer);
+        inFlight--;
+      }
+    })();
+
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  }
+
+  await Promise.all(pending);
+
+  const totals = Object.fromEntries(
+    [
+      'ok',
+      'http_error',
+      'timeout',
+      'connection_error',
+      'driver_error',
+      'missed'
+    ].map(outcome => [
+      outcome,
+      observations.filter(r => r.outcome === outcome).length
+    ])
+  );
+
+  const missed = totals.missed;
+  const dispatched = observations.length - missed;
+
+  const settled =
+    totals.ok +
+    totals.http_error +
+    totals.timeout +
+    totals.connection_error +
+    totals.driver_error;
+
+  const missedByReason = {
+    late: observations.filter(r => r.miss_reason === 'late').length,
+    concurrency: observations.filter(
+      r => r.miss_reason === 'concurrency'
+    ).length
+  };
+
+  console.log(JSON.stringify({
+    prototype: true,
+    offered: observations.length,
+    dispatched,
+    settled,
+    missed,
+    missedByReason,
+    totals,
+    firstFive: observations.slice(0, 5)
+  }, null, 2));
+
+  if (
+    dispatched !== settled ||
+    config.offered !== dispatched + missed
+  ) {
+    process.exitCode = 1;
+    console.error('Accounting invariant failed');
+  }
+}
+
+await runPrototype(config);
