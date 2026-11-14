@@ -1,0 +1,13 @@
+{
+  "name": "experiment-driver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fixed-rate request driver for the deployment experiments",
+  "scripts": {
+    "start": "node driver.js"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
