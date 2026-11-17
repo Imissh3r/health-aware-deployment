@@ -46,3 +46,31 @@ from the same detection event used for automated recovery. A zero-delay case
 measures the best-case baseline. Candidate rejection before a switch and rollback
 after a switch are separate scenarios. Post-promotion failure trials will use an
 in-place fault trigger so they can isolate degradation from container restart.
+
+## Second slice: verified promotion
+
+Run `node tools/controller/promote.mjs` from the host with the routing stack
+running. Save stdout to retain the promotion event. The command expects the
+saved Nginx config to point to `app` and a live response version of `1.0.0`.
+It runs the existing validator before changing the upstream and records
+`PROMOTION_BLOCKED` if validation rejects the candidate or is inconclusive.
+
+The command replaces the config through a temporary file in the mounted
+directory, tests it with `nginx -t`, and reloads Nginx. It records `PROMOTED`
+after three consecutive fresh HTTP 200 responses identify version `2.0.0`.
+Verification uses a five-second window and polls every 200 ms by default.
+Use `--verification-window-ms` and `--verification-interval-ms` to adjust
+these settings. The event records attempts, elapsed time, and the last result.
+
+If the candidate config fails its syntax check, the CLI restores the saved
+file and checks the live stable route. If reload was attempted, it tests and
+reloads the saved file before checking the proxy. A failed promotion keeps its
+own `PROMOTION_FAILED` result and records recovery as `RESTORED` only when the
+file is restored, required Nginx operations succeed, and three fresh HTTP 200
+responses identify version `1.0.0`. Other recovery results are `RECOVERY_FAILED`.
+The CLI exits 1 on promotion failure even when recovery succeeds. Validation
+rejection and inconclusive decisions retain exit codes 2 and 3.
+
+The implementation assumes one routing operator. A completed promotion leaves
+the candidate active. The manual switch-back is available for resetting the
+smoke test, and runtime rollback after a verified promotion is a later slice.
