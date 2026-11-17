@@ -39,6 +39,7 @@ services:
       APP_VERSION: "2.0.0"
       ERROR_EVERY_N_REQUESTS: ${CANDIDATE_ERROR_EVERY_N_REQUESTS:-0}
       RESPONSE_DELAY_MS: ${CANDIDATE_RESPONSE_DELAY_MS:-0}
+      WORKLOAD_FAULT_FILE: /tmp/health-aware-workload-fault
     depends_on:
       db:
         condition: service_healthy

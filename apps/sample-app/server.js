@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import express from 'express';
 import { pool } from './db.js';
 
@@ -5,6 +6,7 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const VERSION = process.env.APP_VERSION || '1.0.0';
+const WORKLOAD_FAULT_FILE = process.env.WORKLOAD_FAULT_FILE;
 
 // Testing response delay failures
 function readNonNegativeInt(name) {
@@ -67,9 +69,11 @@ app.get('/api/work', async (req, res) => {
     await sleep(RESPONSE_DELAY_MS);
   }
 
+  const runtimeFaultActive = WORKLOAD_FAULT_FILE && existsSync(WORKLOAD_FAULT_FILE);
   if (
-    ERROR_EVERY_N_REQUESTS > 0 &&
-    workRequestCount % ERROR_EVERY_N_REQUESTS === 0
+    runtimeFaultActive ||
+    (ERROR_EVERY_N_REQUESTS > 0 &&
+      workRequestCount % ERROR_EVERY_N_REQUESTS === 0)
   ) {
     return res.status(500).json({
       status: 'error',
