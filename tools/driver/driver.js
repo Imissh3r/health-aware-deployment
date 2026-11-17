@@ -345,14 +345,11 @@ function writeRunOutputs(config, observations, metadata) {
     fs.mkdirSync(config.runDir);
 
     step = 'write_requests_csv';
-    const csvPath = writeRequestsCsv(config, observations);
+    writeRequestsCsv(config, observations);
 
     // Publish the run status after the CSV is in place.
     step = 'write_run_json';
-    const jsonPath = writeRunJson(config, metadata);
-
-    console.log(`Request records written to: ${csvPath}`);
-    console.log(`Run metadata written to: ${jsonPath}`);
+    writeRunJson(config, metadata);
   } catch (error) {
     process.exitCode = 1;
     console.error(`Output failure (${step}): ${error.message}`);
@@ -376,19 +373,11 @@ function writeRunOutputs(config, observations, metadata) {
   }
 }
 
-async function runExperiment(config, stopSignal, forceSignal) {
+async function scheduleRequests(config, {
+  start, observations, pending, stopSignal, forceSignal, onFatal
+}) {
   const periodMs = 1000 / config.rate;
-  const observations = [];
-  const pending = new Set();
-
   let inFlight = 0;
-
-  // Collect environment information before measurement begins.
-  const context = collectRunContext();
-
-  // Capture the wall-clock and monotonic origins together.
-  const wallStartMs = Date.now();
-  const start = performance.now();
 
   for (let i = 0; i < config.offered; i++) {
     const scheduled = i * periodMs;
@@ -425,28 +414,29 @@ async function runExperiment(config, stopSignal, forceSignal) {
       warmup: scheduled < config.warmupSeconds * 1000
     };
 
-    observations.push(record);
-
     if (actual - deadline > config.maxLatenessMs) {
       record.outcome = 'missed';
       record.miss_reason = 'late';
+      observations.push(record);
       continue;
     }
 
     if (inFlight >= config.maxConcurrency) {
       record.outcome = 'missed';
       record.miss_reason = 'concurrency';
+      observations.push(record);
       continue;
     }
 
     record.dispatched_ms = actual - start;
     record.dispatch_delay_ms = record.dispatched_ms - scheduled;
 
-    inFlight++;
-
     const abort = new AbortController();
     const requestSignal = AbortSignal.any([abort.signal, forceSignal]);
     const timer = setTimeout(() => abort.abort(), config.timeoutMs);
+
+    observations.push(record);
+    inFlight++;
 
     const task = (async () => {
       try {
@@ -490,21 +480,58 @@ async function runExperiment(config, stopSignal, forceSignal) {
         }
 
       } finally {
+        clearTimeout(timer);
+        inFlight--;
+
         if (record.outcome !== 'interrupted') {
           record.completed_ms = performance.now() - start;
           record.latency_ms = record.completed_ms - record.dispatched_ms;
         }
-
-        clearTimeout(timer);
-        inFlight--;
       }
-    })();
+    })().catch(error => {
+      record.outcome = 'driver_error';
+      record.error_code = error?.code ?? error?.name ?? 'UNKNOWN';
+      onFatal(error);
+    });
 
     pending.add(task);
-    void task.finally(() => pending.delete(task));
+    void task.then(() => pending.delete(task));
+  }
+}
+
+async function runExperiment(config, stopSignal, forceSignal) {
+  const observations = [];
+  const pending = new Set();
+  const fatalStop = new AbortController();
+  const schedulingSignal = AbortSignal.any([stopSignal, fatalStop.signal]);
+
+  let fatalError = null;
+  function onFatal(error) {
+    if (fatalError) return;
+    fatalError = {
+      code: error?.code ?? null,
+      message: error?.message ?? String(error)
+    };
+    fatalStop.abort();
   }
 
+  const context = collectRunContext();
+  const wallStartMs = Date.now();
+  const start = performance.now();
+
+  try {
+    await scheduleRequests(config, {
+      start, observations, pending, stopSignal: schedulingSignal, forceSignal, onFatal
+    });
+  } catch (error) {
+    onFatal(error);
+  }
   await Promise.all(pending);
+
+  if (fatalError) {
+    process.exitCode = 1;
+    console.error(`Fatal run error: ${fatalError.message}`);
+  }
 
   const totals = Object.fromEntries(
     [
@@ -538,18 +565,6 @@ async function runExperiment(config, stopSignal, forceSignal) {
     ).length
   };
 
-  console.log(JSON.stringify({
-    prototype: true,
-    offered: config.offered,
-    dispatched,
-    settled,
-    missed,
-    missedByReason,
-    totals,
-    firstFive: observations.slice(0, 5)
-  }, null, 2));
-
-
   const invariants = {
     offered_accounted:
       config.offered === dispatched + missed,
@@ -568,7 +583,7 @@ async function runExperiment(config, stopSignal, forceSignal) {
   };
 
   const valid = Object.values(invariants).every(Boolean);
-  const status = stopSignal.aborted
+  const status = stopSignal.aborted || fatalError
     ? 'incomplete'
     : valid ? 'complete' : 'invalid';
 
@@ -610,10 +625,12 @@ async function runExperiment(config, stopSignal, forceSignal) {
     },
 
     invariants,
-    review_required: totals.driver_error > 0
+    review_required: Boolean(fatalError) || totals.driver_error > 0,
+    ...(fatalError ? { fatal_error: fatalError } : {})
   };
 
   writeRunOutputs(config, observations, metadata);
+  console.log(JSON.stringify(totals));
 }
 
 const stopScheduling = new AbortController();
