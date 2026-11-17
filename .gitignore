@@ -17,3 +17,6 @@ coverage/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local deployment handoff records
+/deployments/

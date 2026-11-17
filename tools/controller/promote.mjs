@@ -1,9 +1,12 @@
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import {
+  prepareDeployment, readDeployment, readRoutingState, withRoutingLock, writeAtomic,
+  writeDeployment, writeRoutingState
+} from './deployment-state.mjs';
 
 const repoRoot = new URL('../../', import.meta.url);
 const configPath = fileURLToPath(new URL('infra/nginx/conf.d/default.conf', repoRoot));
@@ -62,21 +65,6 @@ function candidateConfig(original) {
   return text.replace(directive, match => match.replace('http://app:3000', 'http://candidate:3000'));
 }
 
-function replaceConfig(contents, mode) {
-  const temporary = `${configPath}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, contents, { flag: 'wx', mode });
-    renameSync(temporary, configPath);
-  } catch (error) {
-    try {
-      rmSync(temporary, { force: true });
-    } catch {
-      // Preserve the original write or rename error.
-    }
-    throw error;
-  }
-}
-
 async function observeProxy(timeoutMs) {
   const signal = AbortSignal.timeout(timeoutMs);
   let status = null;
@@ -129,7 +117,7 @@ async function restore(original, mode, reloadAttempted, settings) {
   const result = { status: 'RECOVERY_FAILED', file_restored: false };
   let step = 'restore_config';
   try {
-    replaceConfig(original, mode);
+    writeAtomic(configPath, original, mode);
     result.file_restored = true;
     if (reloadAttempted) {
       step = 'test_restored_config';
@@ -148,42 +136,83 @@ async function restore(original, mode, reloadAttempted, settings) {
   return result;
 }
 
-async function promote(event) {
-  let stage = 'arguments';
-  let settings;
+async function reconcilePending(id, settings, event) {
+  const { manifest, previous, candidate } = readDeployment(id);
+  const reconciliation = { deployment_id: id, status: 'RECONCILIATION_FAILED' };
+  event.reconciliation = reconciliation;
+  const possibleStates = ['PREPARED', 'PROMOTION_IN_PROGRESS', 'PROMOTED',
+    'PROMOTION_FAILED', 'PROMOTION_INTERRUPTED'];
+  if (manifest.previous_version !== stableVersion || manifest.candidate_version !== candidateVersion ||
+      !possibleStates.includes(manifest.status)) {
+    reconciliation.status = 'CONFLICT';
+    throw new Error('Pending deployment manifest conflicts with the promotion workflow');
+  }
+  const current = readFileSync(configPath);
+  if (!current.equals(previous) && !current.equals(candidate)) {
+    reconciliation.status = 'CONFLICT';
+    throw new Error('Saved route conflicts with the pending deployment snapshots');
+  }
+
+  reconciliation.recovery = await restore(previous, manifest.config_mode, true, settings);
+  if (reconciliation.recovery.status !== 'RESTORED') {
+    reconciliation.status = 'RECOVERY_FAILED';
+    throw new Error('Could not reconcile the interrupted promotion');
+  }
+  writeDeployment(manifest, { status: 'PROMOTION_INTERRUPTED', recovery: reconciliation.recovery });
+  writeRoutingState(null, null);
+  reconciliation.status = 'RECONCILED';
+}
+
+async function promote(event, settings) {
+  let stage = 'reconcile_pending_deployment';
   let original;
   let mode;
+  let activationPending = false;
+  let deployment;
   let configChanged = false;
   let reloadAttempted = false;
 
   try {
-    settings = verificationSettings();
-    event.settings = settings;
+    const state = readRoutingState();
+    if (state.pending_deployment_id) {
+      await reconcilePending(state.pending_deployment_id, settings, event);
+    }
 
     stage = 'check_saved_config';
     original = readFileSync(configPath);
     mode = statSync(configPath).mode & 0o777;
-    const nextConfig = candidateConfig(original);
+    const nextConfig = Buffer.from(candidateConfig(original));
 
     stage = 'verify_stable_route';
     event.preflight = await verifyProxy(stableVersion, settings);
     if (!event.preflight.passed) throw new Error('Could not verify the stable route');
+
+    stage = 'save_deployment_snapshot';
+    deployment = prepareDeployment(original, nextConfig, mode, stableVersion, candidateVersion);
+    event.deployment_id = deployment.deployment_id;
 
     stage = 'validate_candidate';
     const [validation, exitCode] = validateCandidate();
     event.validation = validation;
     if (validation.status === 'FAILED') throw new Error(validation.reason);
     if (validation.status !== 'ELIGIBLE_FOR_PROMOTION') {
+      writeDeployment(deployment, { status: 'PROMOTION_BLOCKED', reason: validation.reason });
       event.status = 'PROMOTION_BLOCKED';
       event.reason = validation.reason;
       return exitCode;
     }
 
+    stage = 'publish_pending_deployment';
+    writeRoutingState(null, deployment.deployment_id);
+    activationPending = true;
+    stage = 'mark_promotion_in_progress';
+    deployment = writeDeployment(deployment, { status: 'PROMOTION_IN_PROGRESS' });
+
     stage = 'write_candidate_config';
     if (!readFileSync(configPath).equals(original)) {
       throw new Error('Saved Nginx configuration changed during validation');
     }
-    replaceConfig(nextConfig, mode);
+    writeAtomic(configPath, nextConfig, mode);
     configChanged = true;
 
     stage = 'test_candidate_config';
@@ -197,6 +226,13 @@ async function promote(event) {
     event.verification = await verifyProxy(candidateVersion, settings);
     if (!event.verification.passed) throw new Error('Could not verify the candidate route');
 
+    stage = 'save_promoted_manifest';
+    deployment = writeDeployment(deployment, {
+      status: 'PROMOTED', verified_at: new Date().toISOString()
+    });
+    stage = 'publish_active_deployment';
+    writeRoutingState(deployment.deployment_id, null);
+
     event.status = 'PROMOTED';
     return 0;
   } catch (error) {
@@ -204,11 +240,33 @@ async function promote(event) {
     event.failed_stage = stage;
     event.reason = error.message;
     if (configChanged) event.recovery = await restore(original, mode, reloadAttempted, settings);
+
+    try {
+      if (deployment) writeDeployment(deployment, {
+        status: 'PROMOTION_FAILED', failed_stage: stage, reason: error.message, recovery: event.recovery
+      });
+      if (activationPending && (!configChanged || event.recovery?.status === 'RESTORED')) {
+        writeRoutingState(null, null);
+      }
+    } catch (stateError) {
+      event.handoff_error = stateError.message;
+    }
     return 1;
   }
 }
 
 const event = { event: 'candidate_promotion', started_at: new Date().toISOString() };
-process.exitCode = await promote(event);
+let failedStage = 'arguments';
+try {
+  const settings = verificationSettings();
+  event.settings = settings;
+  failedStage = 'routing_lock';
+  process.exitCode = await withRoutingLock(() => promote(event, settings));
+} catch (error) {
+  event.status = 'PROMOTION_FAILED';
+  event.failed_stage = failedStage;
+  event.reason = error.message;
+  process.exitCode = 1;
+}
 event.completed_at = new Date().toISOString();
 console.log(JSON.stringify(event, null, 2));

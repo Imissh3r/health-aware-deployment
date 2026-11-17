@@ -103,10 +103,42 @@ These settings are provisional. The conventional baseline will use the
 same fault, probe schedule, and detection rule, with its operator delay
 measured from detection.
 
-Decide how to retain the exact pre-promotion config for the specific
-deployment before implementing the monitor. Verify restoration through
-Nginx with three consecutive HTTP 200 responses from `1.0.0`.
+Use the deployment handoff to recover the exact pre-promotion config.
+Verify restoration through Nginx with three consecutive HTTP 200
+responses from `1.0.0`.
 
 Record fault activation, detection, rollback start, and verified recovery
 as separate events. The Experiment Driver independently records
 client-visible responses through Nginx.
+
+## Deployment handoff
+
+Each promotion reserves a unique directory under `deployments/`. Save
+`previous-nginx.conf`, `candidate-nginx.conf`, and `deployment.json` before
+switching traffic. The snapshots retain the exact bytes used by the
+promotion. The manifest records the deployment ID, expected versions,
+config mode, state, and timestamps. The local records outlive the
+promotion process and are ignored by Git.
+
+Promotion holds the shared `routing.lock` using Linux `flock`. The same
+lock will guard rollback. The shared `active-deployment.json` has either
+an active deployment ID, a pending deployment ID, or two null IDs.
+After validation passes, publish the pending ID and mark the manifest
+`PROMOTION_IN_PROGRESS` before writing the candidate config. After
+proxy verification, mark the manifest `PROMOTED` and atomically replace
+the shared record with the active ID. The shared record is authoritative
+for handoff. A later monitor must match the active ID and the candidate
+config before changing the route.
+
+If final publication fails after a switch, restore and verify the previous
+route. If the CLI exits with a pending ID, the next invocation checks
+the saved route against that deployment's two snapshots. A recognized
+route permits reloading and verifying the previous config under the lock.
+Record `PROMOTION_INTERRUPTED` and clear the pending marker after
+reconciliation. A config conflict or failed recovery leaves the pending
+marker in place for investigation.
+
+Keep routing changes under one operator during the smoke test. A manual
+reset switches Nginx back to stable outside the controller. The saved
+deployment then serves as historical evidence, and the next promotion
+checks the stable route in its preflight.
