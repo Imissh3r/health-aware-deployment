@@ -16,7 +16,7 @@ services:
 
   app:
     build: ./apps/sample-app
-    environment:
+    environment: &app_environment
       APP_VERSION: ${APP_VERSION:-1.0.0}
       PGHOST: db
       PGPORT: 5432
@@ -29,6 +29,29 @@ services:
       - "127.0.0.1:3000:3000"
     depends_on:
       db:
+        condition: service_healthy
+
+  candidate:
+    profiles: [routing]
+    build: ./apps/sample-app
+    environment:
+      <<: *app_environment
+      APP_VERSION: "2.0.0"
+      ERROR_EVERY_N_REQUESTS: ${CANDIDATE_ERROR_EVERY_N_REQUESTS:-0}
+      RESPONSE_DELAY_MS: ${CANDIDATE_RESPONSE_DELAY_MS:-0}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  nginx:
+    profiles: [routing]
+    image: nginx:stable-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      app:
         condition: service_healthy
 
 volumes:
