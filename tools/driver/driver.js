@@ -2,6 +2,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -243,15 +244,25 @@ function csvField(value) {
   return text;
 }
 
+function writeOutputFile(filePath, contents) {
+  const tempPath = `${filePath}.${randomBytes(8).toString('hex')}.tmp`;
+
+  try {
+    fs.writeFileSync(tempPath, contents, { flag: 'wx' });
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Preserve the publication error if temporary-file cleanup also fails.
+    }
+    throw error;
+  }
+
+  return filePath;
+}
+
 function writeRequestsCsv(config, observations) {
-  // The parent directory may need to be created.
-  fs.mkdirSync(path.dirname(config.runDir), {
-    recursive: true
-  });
-
-  // Exclusive creation: fail if this run directory already exists.
-  fs.mkdirSync(config.runDir);
-
   const rows = [CSV_COLUMNS.join(',')];
 
   for (const record of observations) {
@@ -264,15 +275,10 @@ function writeRequestsCsv(config, observations) {
     rows.push(values.map(csvField).join(','));
   }
 
-  const csvPath = path.join(config.runDir, 'requests.csv');
-
-  fs.writeFileSync(
-    csvPath,
-    rows.join('\n') + '\n',
-    { flag: 'wx' }
+  return writeOutputFile(
+    path.join(config.runDir, 'requests.csv'),
+    rows.join('\n') + '\n'
   );
-
-  return csvPath;
 }
 
 function collectRunContext() {
@@ -325,21 +331,54 @@ function collectRunContext() {
 }
 
 function writeRunJson(config, metadata) {
-  const jsonPath = path.join(config.runDir, 'run.json');
-
-  fs.writeFileSync(
-    jsonPath,
-    JSON.stringify(metadata, null, 2) + '\n',
-    { flag: 'wx' }
+  return writeOutputFile(
+    path.join(config.runDir, 'run.json'),
+    JSON.stringify(metadata, null, 2) + '\n'
   );
-
-  return jsonPath;
 }
 
-// Stage 3.2 prototype: in-memory observations only; no output files yet.
-async function runPrototype(config) {
+function writeRunOutputs(config, observations, metadata) {
+  let step = 'create_run_directory';
+
+  try {
+    fs.mkdirSync(path.dirname(config.runDir), { recursive: true });
+    fs.mkdirSync(config.runDir);
+
+    step = 'write_requests_csv';
+    const csvPath = writeRequestsCsv(config, observations);
+
+    // Publish the run status after the CSV is in place.
+    step = 'write_run_json';
+    const jsonPath = writeRunJson(config, metadata);
+
+    console.log(`Request records written to: ${csvPath}`);
+    console.log(`Run metadata written to: ${jsonPath}`);
+  } catch (error) {
+    process.exitCode = 1;
+    console.error(`Output failure (${step}): ${error.message}`);
+
+    if (step === 'create_run_directory') return;
+
+    try {
+      const jsonPath = writeRunJson(config, {
+        ...metadata,
+        status: 'invalid',
+        output_error: {
+          step,
+          code: error.code ?? null,
+          message: error.message
+        }
+      });
+      console.error(`Invalid run recorded at: ${jsonPath}`);
+    } catch (metadataError) {
+      console.error(`Could not persist invalid run status: ${metadataError.message}`);
+    }
+  }
+}
+
+async function runExperiment(config, stopSignal, forceSignal) {
   const periodMs = 1000 / config.rate;
-  const observations = new Array(config.offered);
+  const observations = [];
   const pending = new Set();
 
   let inFlight = 0;
@@ -355,13 +394,19 @@ async function runPrototype(config) {
     const scheduled = i * periodMs;
     const deadline = start + scheduled;
 
-    while (performance.now() < deadline) {
+    while (!stopSignal.aborted && performance.now() < deadline) {
       const remainingMs = deadline - performance.now();
 
-      await new Promise(resolve =>
-        setTimeout(resolve, Math.max(1, Math.ceil(remainingMs)))
-      );
+      try {
+        await sleep(Math.max(1, Math.ceil(remainingMs)), undefined, {
+          signal: stopSignal
+        });
+      } catch (error) {
+        if (error.name !== 'AbortError' || !stopSignal.aborted) throw error;
+      }
     }
+
+    if (stopSignal.aborted) break;
 
     const actual = performance.now();
 
@@ -380,7 +425,7 @@ async function runPrototype(config) {
       warmup: scheduled < config.warmupSeconds * 1000
     };
 
-    observations[i] = record;
+    observations.push(record);
 
     if (actual - deadline > config.maxLatenessMs) {
       record.outcome = 'missed';
@@ -400,13 +445,14 @@ async function runPrototype(config) {
     inFlight++;
 
     const abort = new AbortController();
+    const requestSignal = AbortSignal.any([abort.signal, forceSignal]);
     const timer = setTimeout(() => abort.abort(), config.timeoutMs);
 
     const task = (async () => {
       try {
         const response = await fetch(config.url, {
           redirect: 'manual',
-          signal: abort.signal
+          signal: requestSignal
         });
 
         record.http_status = response.status;
@@ -431,7 +477,9 @@ async function runPrototype(config) {
       } catch (error) {
         const code = error?.cause?.code ?? error?.code;
 
-        if (abort.signal.aborted) {
+        if (forceSignal.aborted && requestSignal.reason === forceSignal.reason) {
+          record.outcome = 'interrupted';
+        } else if (abort.signal.aborted) {
           record.outcome = 'timeout';
         } else if (NETWORK_ERROR_CODES.has(code)) {
           record.outcome = 'connection_error';
@@ -442,9 +490,10 @@ async function runPrototype(config) {
         }
 
       } finally {
-        record.completed_ms = performance.now() - start;
-        record.latency_ms =
-          record.completed_ms - record.dispatched_ms;
+        if (record.outcome !== 'interrupted') {
+          record.completed_ms = performance.now() - start;
+          record.latency_ms = record.completed_ms - record.dispatched_ms;
+        }
 
         clearTimeout(timer);
         inFlight--;
@@ -464,6 +513,7 @@ async function runPrototype(config) {
       'timeout',
       'connection_error',
       'driver_error',
+      'interrupted',
       'missed'
     ].map(outcome => [
       outcome,
@@ -490,7 +540,7 @@ async function runPrototype(config) {
 
   console.log(JSON.stringify({
     prototype: true,
-    offered: observations.length,
+    offered: config.offered,
     dispatched,
     settled,
     missed,
@@ -518,9 +568,11 @@ async function runPrototype(config) {
   };
 
   const valid = Object.values(invariants).every(Boolean);
-  const status = valid ? 'complete' : 'invalid';
+  const status = stopSignal.aborted
+    ? 'incomplete'
+    : valid ? 'complete' : 'invalid';
 
-  if (!valid) {
+  if (status === 'invalid') {
     process.exitCode = 1;
     console.error('Run accounting validation failed');
   }
@@ -561,12 +613,28 @@ async function runPrototype(config) {
     review_required: totals.driver_error > 0
   };
 
-  const csvPath = writeRequestsCsv(config, observations);
-  const jsonPath = writeRunJson(config, metadata);
-
-  console.log(`Request records written to: ${csvPath}`);
-  console.log(`Run metadata written to: ${jsonPath}`);
-
+  writeRunOutputs(config, observations, metadata);
 }
 
-await runPrototype(config);
+const stopScheduling = new AbortController();
+const cancelRequests = new AbortController();
+
+function onStop(signal) {
+  if (stopScheduling.signal.aborted) {
+    cancelRequests.abort();
+    return;
+  }
+
+  process.exitCode = signal === 'SIGINT' ? 130 : 143;
+  stopScheduling.abort();
+}
+
+process.on('SIGINT', onStop);
+process.on('SIGTERM', onStop);
+
+try {
+  await runExperiment(config, stopScheduling.signal, cancelRequests.signal);
+} finally {
+  process.off('SIGINT', onStop);
+  process.off('SIGTERM', onStop);
+}
