@@ -10,6 +10,8 @@ export const deploymentsPath = fileURLToPath(new URL('../../deployments/', impor
 const routingStatePath = join(deploymentsPath, 'active-deployment.json');
 const deploymentIdPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
+export class RoutingLockBusyError extends Error {}
+
 function directoryFor(id) {
   if (typeof id !== 'string' || !deploymentIdPattern.test(id)) {
     throw new Error('Invalid deployment ID');
@@ -26,7 +28,9 @@ export async function withRoutingLock(callback) {
       stdio: ['ignore', 'ignore', 'pipe', fd], encoding: 'utf8', timeout: 5000
     });
     if (result.error) throw result.error;
-    if (result.status === 75) throw new Error('Routing lock is held by another operation');
+    if (result.status === 75) {
+      throw new RoutingLockBusyError('Routing lock is held by another operation');
+    }
     if (result.status !== 0) throw new Error(result.stderr.trim() || 'Could not acquire routing lock');
     return await callback();
   } finally {

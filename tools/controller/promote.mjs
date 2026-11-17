@@ -7,10 +7,10 @@ import {
   prepareDeployment, readDeployment, readRoutingState, withRoutingLock, writeAtomic,
   writeDeployment, writeRoutingState
 } from './deployment-state.mjs';
+import { observeProxy } from './observe-proxy.mjs';
 
 const repoRoot = new URL('../../', import.meta.url);
 const configPath = fileURLToPath(new URL('infra/nginx/conf.d/default.conf', repoRoot));
-const proxyUrl = 'http://127.0.0.1:8080/api/work';
 const stableVersion = '1.0.0';
 const candidateVersion = '2.0.0';
 
@@ -63,25 +63,6 @@ function candidateConfig(original) {
     throw new Error('Expected one saved proxy_pass to app:3000');
   }
   return text.replace(directive, match => match.replace('http://app:3000', 'http://candidate:3000'));
-}
-
-async function observeProxy(timeoutMs) {
-  const signal = AbortSignal.timeout(timeoutMs);
-  let status = null;
-  try {
-    const response = await fetch(proxyUrl, {
-      signal, redirect: 'manual', headers: { Connection: 'close' }
-    });
-    status = response.status;
-    if (status === 200) {
-      const body = await response.json();
-      return { http_status: status, version: body?.version ?? null };
-    }
-    await response.body?.cancel();
-    return { http_status: status, version: null };
-  } catch (error) {
-    return { http_status: status, version: null, error: error.message };
-  }
 }
 
 async function verifyProxy(version, settings) {

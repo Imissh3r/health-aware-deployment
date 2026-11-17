@@ -95,13 +95,38 @@ Record the candidate container ID and start time before setting the flag
 and after clearing it. Both values must match. Reset the test stack to the
 stable route using the verified manual switch-back.
 
-## Later slice: monitoring and runtime rollback
+## Runtime monitoring and ownership
 
-The first monitoring trial will probe the workload through Nginx once per
-second. Three consecutive HTTP 500 responses from `2.0.0` trigger rollback.
-These settings are provisional. The conventional baseline will use the
-same fault, probe schedule, and detection rule, with its operator delay
-measured from detection.
+Run `node tools/controller/monitor.mjs <deployment-id>` after promotion.
+The monitor probes `/api/work` through Nginx once per second. Three
+consecutive HTTP 500 responses containing the candidate version from the
+manifest (currently `2.0.0`) trigger an ownership check. Any other result
+breaks the streak. Each request, including its response body, has a
+1,000 ms timeout.
+
+Routine probes run outside the routing lock. When the lock is acquired,
+require the monitored ID to match the active ID, the pending ID to be
+`null`, the manifest to be `PROMOTED`, and the installed Nginx config
+to match the saved candidate config byte for byte. Confirm the failure
+with one fresh probe while holding the lock.
+
+| Monitor event | Behaviour |
+|---|---|
+| `DEGRADATION_CONFIRMED` | The deployment still owns the route and the confirmation qualified. Exit 0. |
+| `LOST_OWNERSHIP` | The ownership check failed. Exit 2 without a confirmation probe. |
+| `DEGRADATION_CLEARED` | The confirmation did not qualify. Release the lock, reset the streak, and continue probing. |
+| `LOCK_BUSY` | Continue probing outside the lock. Retry on the next probe if the streak still qualifies. |
+| `MONITOR_FAILED` | An input, state read, or controller operation failed. Exit 1. |
+
+The CLI emits JSON lines on stdout. This slice records the decision
+without changing routing. Run `node --test tools/controller/monitor.test.mjs`
+to check detection, lock contention, confirmation, and a deterministic
+ownership change from A to B with identical configuration and version.
+
+## Later slice: runtime rollback
+
+The conventional baseline will use the same fault, probe schedule, and
+detection rule, with its operator delay measured from detection.
 
 Use the deployment handoff to recover the exact pre-promotion config.
 Verify restoration through Nginx with three consecutive HTTP 200
