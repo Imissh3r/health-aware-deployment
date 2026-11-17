@@ -112,29 +112,56 @@ with one fresh probe while holding the lock.
 
 | Monitor event | Behaviour |
 |---|---|
-| `DEGRADATION_CONFIRMED` | The deployment still owns the route and the confirmation qualified. Exit 0. |
+| `ROLLED_BACK` | The locked rollback verified the previous version and cleared routing ownership. Exit 0. |
 | `LOST_OWNERSHIP` | The ownership check failed. Exit 2 without a confirmation probe. |
 | `DEGRADATION_CLEARED` | The confirmation did not qualify. Release the lock, reset the streak, and continue probing. |
 | `LOCK_BUSY` | Continue probing outside the lock. Retry on the next probe if the streak still qualifies. |
+| `ROLLBACK_FAILED` | Recovery stopped before verifying the previous version. Exit 1. |
+| `FINALIZATION_FAILED` | The previous version was verified and an ownership or manifest write failed. Exit 1. |
+| `RECONCILIATION_REQUIRED` | An active deployment has an unresolved rollback. Exit 1 and use the operator command below. |
 | `MONITOR_FAILED` | An input, state read, or controller operation failed. Exit 1. |
 
-The CLI emits JSON lines on stdout. This slice records the decision
-without changing routing. Run `node --test tools/controller/monitor.test.mjs`
-to check detection, lock contention, confirmation, and a deterministic
-ownership change from A to B with identical configuration and version.
+The CLI emits JSON lines on stdout. The rollback event includes timestamps
+for detection, confirmation and recovery verification. Run
+`node --test tools/controller/monitor.test.mjs` to check detection, lock
+contention, stale ownership and recovery failures.
 
-## Later slice: runtime rollback
+## Runtime rollback and operator reconciliation
 
-The conventional baseline will use the same fault, probe schedule, and
+The monitor keeps the routing lock through confirmation, recovery and
+finalization. After a qualifying confirmation, record
+`ROLLBACK_IN_PROGRESS` in the deployment manifest, atomically install the
+exact previous Nginx config, run `nginx -t`, and reload Nginx. Require
+three consecutive HTTP 200 responses from the previous version (currently
+`1.0.0`) through the proxy within five seconds.
+
+Record `RECOVERY_VERIFIED_PENDING_FINALIZATION` in the manifest before
+clearing the active ID. The manifest preserves verification evidence.
+The rollback is finalized when the shared routing record releases the
+deployment ID. Reading the two records together distinguishes verified
+recovery awaiting finalization from a finalized rollback without a
+third metadata write.
+
+On failure, the result records the failed step, installed-config status,
+and last observed proxy response. A failure before the verified manifest
+write leaves the manifest in progress if the initial attempt was recorded.
+A failure clearing the ID preserves the verified manifest and the active
+ID. Promotion refuses to replace an active deployment in either unresolved
+state.
+
+To resume an unresolved rollback after inspecting the failure, run
+`node tools/controller/monitor.mjs --reconcile <deployment-id>`.
+The command requires the same active ID, no pending promotion, and an
+installed config matching either saved snapshot. It reuses the locked
+test, reload, verification and finalization sequence. It exits 1 with
+`RECONCILIATION_REFUSED` if there is no unresolved rollback for the owner
+or the config conflicts with both snapshots. Ordinary monitoring surfaces
+unresolved rollback for operator action.
+
+The conventional baseline will use the same fault, probe schedule and
 detection rule, with its operator delay measured from detection.
-
-Use the deployment handoff to recover the exact pre-promotion config.
-Verify restoration through Nginx with three consecutive HTTP 200
-responses from `1.0.0`.
-
-Record fault activation, detection, rollback start, and verified recovery
-as separate events. The Experiment Driver independently records
-client-visible responses through Nginx.
+The Experiment Driver independently records client-visible responses
+through Nginx.
 
 ## Deployment handoff
 

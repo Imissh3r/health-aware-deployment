@@ -12,6 +12,10 @@ const deploymentIdPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
 export class RoutingLockBusyError extends Error {}
 
+export function requiresRollbackReconciliation(status) {
+  return status === 'ROLLBACK_IN_PROGRESS' || status === 'RECOVERY_VERIFIED_PENDING_FINALIZATION';
+}
+
 function directoryFor(id) {
   if (typeof id !== 'string' || !deploymentIdPattern.test(id)) {
     throw new Error('Invalid deployment ID');
@@ -105,13 +109,19 @@ export function prepareDeployment(previous, candidate, mode, previousVersion, ca
   }, { status: 'PREPARED' });
 }
 
-export function readDeployment(id) {
+export function readDeploymentManifest(id) {
   const directory = directoryFor(id);
   const manifest = JSON.parse(readFileSync(join(directory, 'deployment.json'), 'utf8'));
   if (manifest?.deployment_id !== id ||
       !Number.isInteger(manifest.config_mode) || manifest.config_mode < 0 || manifest.config_mode > 0o777) {
     throw new Error('Invalid deployment manifest');
   }
+  return manifest;
+}
+
+export function readDeployment(id) {
+  const manifest = readDeploymentManifest(id);
+  const directory = directoryFor(id);
   return {
     manifest,
     previous: readFileSync(join(directory, 'previous-nginx.conf')),

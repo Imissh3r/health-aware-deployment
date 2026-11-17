@@ -1,16 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
-  prepareDeployment, readDeployment, readRoutingState, withRoutingLock, writeAtomic,
-  writeDeployment, writeRoutingState
+  prepareDeployment, readDeployment, readDeploymentManifest, readRoutingState,
+  requiresRollbackReconciliation, withRoutingLock, writeAtomic, writeDeployment, writeRoutingState
 } from './deployment-state.mjs';
-import { observeProxy } from './observe-proxy.mjs';
+import { configPath, nginx, verifyProxy } from './nginx-routing.mjs';
 
 const repoRoot = new URL('../../', import.meta.url);
-const configPath = fileURLToPath(new URL('infra/nginx/conf.d/default.conf', repoRoot));
 const stableVersion = '1.0.0';
 const candidateVersion = '2.0.0';
 
@@ -36,14 +34,6 @@ function run(command, args, timeout) {
   return result;
 }
 
-function nginx(...args) {
-  const result = run('docker', ['compose', '--profile', 'routing', 'exec',
-    '-T', 'nginx', 'nginx', ...args], 10_000);
-  if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || `nginx exited with status ${result.status}`);
-  }
-}
-
 function validateCandidate() {
   const result = run(process.execPath, [fileURLToPath(new URL('./validate.mjs', import.meta.url))],
     20_000);
@@ -63,35 +53,6 @@ function candidateConfig(original) {
     throw new Error('Expected one saved proxy_pass to app:3000');
   }
   return text.replace(directive, match => match.replace('http://app:3000', 'http://candidate:3000'));
-}
-
-async function verifyProxy(version, settings) {
-  const start = performance.now();
-  const deadline = start + settings.verification_window_ms;
-  let attempts = 0;
-  let consecutive = 0;
-  let last = null;
-
-  while (true) {
-    const remaining = Math.floor(deadline - performance.now());
-    if (remaining < 1) break;
-    attempts++;
-    last = await observeProxy(Math.min(remaining, 1000));
-    consecutive = last.http_status === 200 && last.version === version ? consecutive + 1 : 0;
-    const timeLeft = deadline - performance.now();
-    if (consecutive === 3 || timeLeft < 1) break;
-    await sleep(Math.min(settings.verification_interval_ms, timeLeft));
-  }
-
-  const elapsedMs = performance.now() - start;
-  return {
-    passed: consecutive === 3 && elapsedMs <= settings.verification_window_ms,
-    expected_version: version,
-    attempts,
-    consecutive,
-    elapsed_ms: elapsedMs,
-    last_observation: last
-  };
 }
 
 async function restore(original, mode, reloadAttempted, settings) {
@@ -145,7 +106,7 @@ async function reconcilePending(id, settings, event) {
 }
 
 async function promote(event, settings) {
-  let stage = 'reconcile_pending_deployment';
+  let stage = 'check_unresolved_rollback';
   let original;
   let mode;
   let activationPending = false;
@@ -155,6 +116,13 @@ async function promote(event, settings) {
 
   try {
     const state = readRoutingState();
+    if (state.deployment_id &&
+        requiresRollbackReconciliation(readDeploymentManifest(state.deployment_id).status)) {
+      event.blocking_deployment_id = state.deployment_id;
+      throw new Error('Resolve the active deployment rollback before promoting a candidate');
+    }
+
+    stage = 'reconcile_pending_deployment';
     if (state.pending_deployment_id) {
       await reconcilePending(state.pending_deployment_id, settings, event);
     }
