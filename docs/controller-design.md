@@ -74,3 +74,39 @@ rejection and inconclusive decisions retain exit codes 2 and 3.
 The implementation assumes one routing operator. A completed promotion leaves
 the candidate active. The manual switch-back is available for resetting the
 smoke test, and runtime rollback after a verified promotion is a later slice.
+
+## Third slice: in-place fault after promotion
+
+Use verified promotion to bring a healthy `candidate` (`2.0.0`) onto the
+Nginx route. The candidate service explicitly opts into a fault flag in its
+container-local filesystem. The operator sets and clears the flag using
+`docker compose exec` on `candidate`. With the flag set, candidate
+`/api/work` returns HTTP 500 with its version. The flag affects only the
+candidate workload endpoint.
+
+| Check | Expected response |
+|---|---|
+| Through Nginx before setting the flag | HTTP 200, version `2.0.0` |
+| Through Nginx after setting the flag | HTTP 500, version `2.0.0` |
+| Direct stable request while the flag is set | HTTP 200, version `1.0.0` |
+| Through Nginx after clearing the flag | HTTP 200, version `2.0.0` |
+
+Record the candidate container ID and start time before setting the flag
+and after clearing it. Both values must match. Reset the test stack to the
+stable route using the verified manual switch-back.
+
+## Later slice: monitoring and runtime rollback
+
+The first monitoring trial will probe the workload through Nginx once per
+second. Three consecutive HTTP 500 responses from `2.0.0` trigger rollback.
+These settings are provisional. The conventional baseline will use the
+same fault, probe schedule, and detection rule, with its operator delay
+measured from detection.
+
+Decide how to retain the exact pre-promotion config for the specific
+deployment before implementing the monitor. Verify restoration through
+Nginx with three consecutive HTTP 200 responses from `1.0.0`.
+
+Record fault activation, detection, rollback start, and verified recovery
+as separate events. The Experiment Driver independently records
+client-visible responses through Nginx.
