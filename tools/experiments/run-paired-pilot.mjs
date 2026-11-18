@@ -7,6 +7,7 @@ import { parseArgs, promisify } from 'node:util';
 import { readRoutingState, writeAtomic } from '../controller/deployment-state.mjs';
 import { configPath } from '../controller/nginx-routing.mjs';
 import { observeProxy } from '../controller/observe-proxy.mjs';
+import { runPilot } from './pilot-trial.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const resultsDir = join(repoRoot, 'experiments', 'results');
@@ -26,13 +27,12 @@ function parseTrialArgs() {
   const names = tokens.map(token => token.name);
   if (new Set(names).size !== names.length) throw new Error('Each option may be supplied only once');
   if (values.arm !== 'A' && values.arm !== 'B') throw new Error('--arm must be A or B');
-  if (!values['preflight-only']) throw new Error('Stage 1 requires --preflight-only');
 
   const id = values['trial-id'] ?? `pilot-${values.arm.toLowerCase()}-${randomUUID()}`;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
     throw new Error('--trial-id must start with a letter or digit and use only letters, digits, dots, dashes, or underscores');
   }
-  return { arm: values.arm, trial_id: id };
+  return { arm: values.arm, trial_id: id, preflight_only: values['preflight-only'] ?? false };
 }
 
 function reserveTrial(trialId) {
@@ -115,14 +115,19 @@ const report = { event: 'pilot_preflight', started_at: new Date().toISOString(),
 try {
   Object.assign(report, parseTrialArgs());
   Object.assign(report, reserveTrial(report.trial_id));
-  await checkPreflight(report.checks);
-  report.status = 'PREFLIGHT_PASSED';
+  if (report.preflight_only) {
+    await checkPreflight(report.checks);
+    report.status = 'PREFLIGHT_PASSED';
+  } else {
+    report.event = 'paired_pilot';
+    await runPilot(report, { repoRoot, resultsDir, faultFlag, compose, checkPreflight });
+  }
 } catch (error) {
-  report.status = 'PREFLIGHT_FAILED';
+  report.status = report.event === 'paired_pilot' ? 'TRIAL_FAILED' : 'PREFLIGHT_FAILED';
   report.reason = error.message;
 }
-report.completed_at = new Date().toISOString();
-if (report.staging_dir) {
+report.completed_at ??= new Date().toISOString();
+if (report.preflight_only && report.staging_dir) {
   try {
     writeAtomic(join(report.staging_dir, 'preflight.json'), JSON.stringify(report, null, 2) + '\n');
   } catch (error) {
@@ -131,4 +136,4 @@ if (report.staging_dir) {
   }
 }
 console.log(JSON.stringify(report, null, 2));
-if (report.status !== 'PREFLIGHT_PASSED') process.exitCode = 1;
+if (report.status !== 'PREFLIGHT_PASSED' && report.status !== 'TRIAL_PASSED') process.exitCode = 1;
