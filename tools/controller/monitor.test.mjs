@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { observeProxy } from './observe-proxy.mjs';
 
 const healthy = { http_status: 200, version: '2.0.0' };
@@ -69,6 +70,8 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
     assert.equal(probes, 4);
     assert.equal(events[0].consecutive_failures, 3);
     assert.deepEqual(events[0].confirmation, failed);
+    assert.ok(Date.parse(events[0].first_failure_probe_at) < Date.parse(events[0].observed_at));
+    assert.equal(events[0].reconfirmed_at, undefined);
     assert.deepEqual(await readFile(statePath), stateBefore);
   });
 
@@ -333,6 +336,155 @@ describe('locked rollback', { concurrency: true, timeout: 15000 }, () => {
       assert.deepEqual(calls, stages.filter(item => item !== 'CONFIG_WRITE'));
       assert.equal(routing.readRoutingState().deployment_id, null);
     });
+  }
+});
+
+describe('scripted operator delay', { concurrency: true, timeout: 15000 }, () => {
+  for (const operatorDelayMs of [40, 0]) {
+    test(`uses two confirmations for a delay of ${operatorDelayMs} ms and verifies recovery`, async t => {
+      const lab = await fixture(t);
+      const { routing, deploymentId, configPath, monitorDeployment, rollbackDeployment } = lab;
+      const { calls, operations } = recoveryFixture(lab);
+      const events = [];
+      let probes = 0;
+      let lockAttempts = 0;
+      const probeTimes = [];
+      const status = await monitorDeployment(deploymentId, {
+        operatorDelayMs,
+        observe: async () => {
+          probeTimes.push(Date.now());
+          return ++probes === 2 ? healthy : failed;
+        },
+        async lockRouting(action) {
+          lockAttempts++;
+          return routing.withRoutingLock(action);
+        },
+        recover: (deployment, observation) => rollbackDeployment(deployment, observation, operations),
+        report: event => events.push(event)
+      });
+
+      assert.equal(status, 'ROLLED_BACK');
+      assert.equal(probes, 7);
+      assert.equal(lockAttempts, 2);
+      const [started, result] = events;
+      assert.deepEqual(events.map(event => event.status), ['OPERATOR_DELAY_STARTED', 'ROLLED_BACK']);
+      assert.equal(started.operator_delay_ms, operatorDelayMs);
+      assert.equal(started.confirmed_at, result.confirmed_at);
+      assert.deepEqual(started.first_confirmation, failed);
+      assert.deepEqual(result.confirmation, failed);
+      const firstProbe = Date.parse(result.first_failure_probe_at);
+      assert.ok(firstProbe >= probeTimes[2] && firstProbe < probeTimes[3]);
+      assert.ok(Date.parse(result.reconfirmed_at) - Date.parse(result.confirmed_at) >= operatorDelayMs);
+      assert.ok(Date.parse(result.recovery.started_at) >= Date.parse(result.reconfirmed_at));
+      assert.equal(result.recovery.verification.consecutive, 3);
+      assert.deepEqual(calls, stages);
+      assert.deepEqual(await readFile(configPath), previousConfig);
+      assert.equal(routing.readRoutingState().deployment_id, null);
+    });
+  }
+
+  test('fault clearance during the wait stops the attempt and retains ownership', async t => {
+    const { routing, monitorDeployment, deploymentId, statePath, configPath } = await fixture(t);
+    const stateBefore = await readFile(statePath);
+    const events = [];
+    let faultActive = true;
+    const status = await monitorDeployment(deploymentId, {
+      operatorDelayMs: 20,
+      observe: async () => faultActive ? failed : healthy,
+      recover: () => assert.fail('A recovered candidate must keep its route'),
+      report(event) {
+        events.push(event);
+        if (event.status === 'OPERATOR_DELAY_STARTED') faultActive = false;
+      }
+    });
+    assert.equal(status, 'DEGRADATION_CLEARED');
+    assert.deepEqual(events.map(event => event.status), ['OPERATOR_DELAY_STARTED', 'DEGRADATION_CLEARED']);
+    assert.deepEqual(events[1].first_confirmation, failed);
+    assert.deepEqual(events[1].confirmation, healthy);
+    assert.equal(routing.readDeploymentManifest(deploymentId).status, 'PROMOTED');
+    assert.deepEqual(await readFile(statePath), stateBefore);
+    assert.deepEqual(await readFile(configPath), candidateConfig);
+  });
+
+  test('a deployment published during the unlocked wait supersedes the original owner', async t => {
+    const { routing, monitorDeployment, publish, deploymentId, configPath } = await fixture(t);
+    const events = [];
+    let takeover;
+    let probes = 0;
+    const status = await monitorDeployment(deploymentId, {
+      operatorDelayMs: 20,
+      async observe() {
+        assert.ok(++probes <= 4, 'A probed again after B took ownership');
+        return failed;
+      },
+      async lockRouting(action) {
+        await takeover;
+        return routing.withRoutingLock(action);
+      },
+      recover: () => assert.fail('A attempted rollback of B'),
+      report(event) {
+        events.push(event);
+        if (event.status === 'OPERATOR_DELAY_STARTED') takeover = publish();
+      }
+    });
+    const idB = await takeover;
+    assert.notEqual(idB, deploymentId);
+    assert.equal(status, 'LOST_OWNERSHIP');
+    assert.equal(events[1].active_deployment_id, idB);
+    assert.equal(events[1].confirmed_at, events[0].confirmed_at);
+    assert.equal(routing.readRoutingState().deployment_id, idB);
+    assert.equal(routing.readDeploymentManifest(idB).status, 'PROMOTED');
+    assert.deepEqual(await readFile(configPath), candidateConfig);
+  });
+
+  test('contention at the second lock ends the attempt without a second delay', async t => {
+    const { routing, monitorDeployment, deploymentId } = await fixture(t);
+    const release = Promise.withResolvers();
+    const events = [];
+    let holder;
+    let probes = 0;
+    try {
+      const status = await monitorDeployment(deploymentId, {
+        operatorDelayMs: 20,
+        async observe() {
+          assert.ok(++probes <= 4, 'Monitor restarted the probe loop after the second lock attempt');
+          return failed;
+        },
+        recover: () => assert.fail('Rollback began while another operation held the lock'),
+        report(event) {
+          events.push(event);
+          if (event.status === 'OPERATOR_DELAY_STARTED') {
+            holder = routing.withRoutingLock(() => release.promise);
+          }
+        }
+      });
+      assert.equal(status, 'DELAYED_ROLLBACK_NOT_STARTED');
+      assert.deepEqual(events.map(event => event.status), ['OPERATOR_DELAY_STARTED', 'DELAYED_ROLLBACK_NOT_STARTED']);
+      assert.equal(events[1].blocked_by, 'LOCK_BUSY');
+      assert.equal(events[1].confirmed_at, events[0].confirmed_at);
+      assert.equal(routing.readRoutingState().deployment_id, deploymentId);
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  });
+});
+
+test('monitor CLI rejects invalid, repeated, or incompatible delay options', () => {
+  const cli = fileURLToPath(new URL('./monitor.mjs', import.meta.url));
+  for (const args of [
+    ['--operator-delay-ms', '-1', 'deployment'],
+    ['--operator-delay-ms', 'ten', 'deployment'],
+    ['--operator-delay-ms', '2147483648', 'deployment'],
+    ['--operator-delay-ms', '0', '--operator-delay-ms', '1', 'deployment'],
+    ['--reconcile', 'deployment', '--operator-delay-ms', '0'],
+    ['deployment', '--operator-delay-ms']
+  ]) {
+    const result = spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 1, [args, result.error, result.stderr].join(' '));
+    const event = JSON.parse(result.stdout);
+    assert.equal(event.status, 'MONITOR_FAILED');
+    assert.doesNotMatch(event.reason, /Invalid deployment ID/);
   }
 });
 
