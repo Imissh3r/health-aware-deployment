@@ -21,5 +21,8 @@ Thumbs.db
 # Local deployment handoff records
 /deployments/
 
+# Live Nginx configuration
+/runtime/nginx/
+
 # Local experiment evidence
 /experiments/results/

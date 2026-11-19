@@ -135,7 +135,31 @@ uses a single WSL2 host, a shared database, and a controlled runtime fault.
 Use the first pair to validate evidence collection and resetting. Alternate
 arm order for subsequent repeated pairs.
 
-Promotion changes the tracked Nginx config, so V1 can record a dirty
-working tree at driver start. Preserve that provenance and the config
-snapshots for the pilot. Resolve the runtime config's effect on source
-provenance before collecting the formal comparison data.
+## Nginx runtime setup and provenance
+
+Before starting the routing profile on a fresh checkout, run
+`node tools/controller/init-nginx-runtime.mjs`. It seeds
+`runtime/nginx/conf.d/default.conf` from the tracked stable template at
+`infra/nginx/conf.d/default.conf` when the runtime file is absent and both
+deployment IDs are clear. Initialization preserves existing files.
+
+For the first migration, confirm clear deployment ownership, initialize
+the runtime file, and run `docker compose --profile routing up -d --wait`.
+Verify that the Nginx container mounts `runtime/nginx/conf.d` read-only,
+`nginx -t` succeeds, and the proxy returns HTTP 200 from stable `1.0.0`.
+Keep the mounted directory in place during operation. Promotion and
+rollback replace the file within it.
+
+Template edits apply on a fresh initialization. For a deliberate reset of
+the runtime file from the updated template, save the existing config,
+confirm both deployment IDs are clear, stop Nginx, then remove only the
+runtime file and rerun initialization before restarting Nginx.
+
+Use a clean, committed checkout for repeated trials. Verify that Git stays
+clean while the candidate serves and that V1 records `git.working_tree`
+as `clean` at measurement start. The saved candidate and previous
+snapshots record the exact routing configuration for each trial.
+
+The original pilot pair ran before runtime isolation. The runner patch
+was uncommitted and promotion modified the tracked Nginx config. Preserve
+the original dirty-tree metadata and snapshots with the pilot evidence.

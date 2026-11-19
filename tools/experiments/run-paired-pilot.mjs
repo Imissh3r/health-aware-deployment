@@ -1,11 +1,11 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { readRoutingState, writeAtomic } from '../controller/deployment-state.mjs';
-import { configPath } from '../controller/nginx-routing.mjs';
+import { readRuntimeConfig } from '../controller/nginx-routing.mjs';
 import { observeProxy } from '../controller/observe-proxy.mjs';
 import { runPilot } from './pilot-trial.mjs';
 
@@ -77,7 +77,7 @@ async function checkPreflight(checks) {
     throw new Error('Active and pending deployment IDs must both be null');
   }
 
-  const config = readFileSync(configPath, 'utf8');
+  const config = readRuntimeConfig().toString('utf8');
   checks.config_upstreams = Array.from(
     config.matchAll(/^[\t ]*proxy_pass[\t ]+([^;\r\n]+);/gm), match => match[1]
   );

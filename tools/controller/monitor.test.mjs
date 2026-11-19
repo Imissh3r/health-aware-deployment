@@ -18,7 +18,7 @@ async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'deployment-monitor-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const controller = join(root, 'tools', 'controller');
-  const configDir = join(root, 'infra', 'nginx', 'conf.d');
+  const configDir = join(root, 'runtime', 'nginx', 'conf.d');
   await Promise.all([controller, configDir].map(path => mkdir(path, { recursive: true })));
   for (const file of ['deployment-state.mjs', 'monitor.mjs', 'nginx-routing.mjs',
     'observe-proxy.mjs', 'rollback.mjs']) {

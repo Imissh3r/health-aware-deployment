@@ -1,10 +1,23 @@
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { observeProxy } from './observe-proxy.mjs';
 
 const repoRoot = new URL('../../', import.meta.url);
-export const configPath = fileURLToPath(new URL('infra/nginx/conf.d/default.conf', repoRoot));
+export const configPath = fileURLToPath(new URL('runtime/nginx/conf.d/default.conf', repoRoot));
+
+export function readRuntimeConfig() {
+  try {
+    return readFileSync(configPath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    throw new Error(
+      'Nginx runtime config is missing. Run node tools/controller/init-nginx-runtime.mjs with both deployment IDs clear.',
+      { cause: error }
+    );
+  }
+}
 
 export function nginx(...args) {
   const result = spawnSync('docker', ['compose', '--profile', 'routing', 'exec',

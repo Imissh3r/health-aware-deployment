@@ -19,7 +19,7 @@ async function fixture(t) {
   const controllers = join(root, 'tools/controller');
   const experiments = join(root, 'tools/experiments');
   const bin = join(root, 'bin');
-  const config = join(root, 'infra/nginx/conf.d');
+  const config = join(root, 'runtime/nginx/conf.d');
   const deployments = join(root, 'deployments');
   for (const directory of [controllers, experiments, bin, config, deployments]) {
     await mkdir(directory, { recursive: true });
@@ -181,7 +181,7 @@ export const id = '62621658-5e08-4c66-a028-2516fc6e0a77';
 export const mode = process.env.PILOT_TRIAL_MODE;
 export const arm = process.env.PILOT_EXPECT_ARM;
 export const deployPath = join('deployments', id);
-export const configPath = 'infra/nginx/conf.d/default.conf';
+export const configPath = 'runtime/nginx/conf.d/default.conf';
 export const statePath = 'deployments/active-deployment.json';
 export const timestamp = () => new Date().toISOString();
 export function save(file, value) { writeFileSync(file, JSON.stringify(value)); }
@@ -420,5 +420,16 @@ test('refuses active or pending ownership and a candidate config on disk', async
   assert.equal(exit, 1);
   assert.match(report.reason, /installed Nginx config must point to stable/);
   assert.equal(await readFile(lab.configPath, 'utf8'), changedConfig);
+  assert.equal(existsSync(lab.callsPath), false);
+});
+
+test('pilot preflight reports how to initialize a missing runtime config', async t => {
+  const lab = await fixture(t);
+  await rm(lab.configPath);
+  const { exit, report } = lab.run(['--arm', 'A', '--preflight-only']);
+  assert.equal(exit, 1);
+  assert.equal(report.status, 'PREFLIGHT_FAILED');
+  assert.match(report.reason, /init-nginx-runtime\.mjs/);
+  assert.equal(existsSync(lab.configPath), false);
   assert.equal(existsSync(lab.callsPath), false);
 });

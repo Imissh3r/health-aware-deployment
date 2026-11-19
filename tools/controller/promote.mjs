@@ -6,7 +6,7 @@ import {
   prepareDeployment, readDeployment, readDeploymentManifest, readRoutingState,
   requiresRollbackReconciliation, withRoutingLock, writeAtomic, writeDeployment, writeRoutingState
 } from './deployment-state.mjs';
-import { configPath, nginx, verifyProxy } from './nginx-routing.mjs';
+import { configPath, nginx, readRuntimeConfig, verifyProxy } from './nginx-routing.mjs';
 
 const repoRoot = new URL('../../', import.meta.url);
 const stableVersion = '1.0.0';
@@ -128,7 +128,7 @@ async function promote(event, settings) {
     }
 
     stage = 'check_saved_config';
-    original = readFileSync(configPath);
+    original = readRuntimeConfig();
     mode = statSync(configPath).mode & 0o777;
     const nextConfig = Buffer.from(candidateConfig(original));
 
