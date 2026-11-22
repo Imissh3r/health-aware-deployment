@@ -1,0 +1,141 @@
+{
+  "schedule_id": "formal-paired-trials-v1",
+  "status": "frozen",
+  "pilot_pair_included": false,
+  "target_evaluable_pairs": 12,
+  "seed_hex": "f30c7f438ff11af68addb80feee656d1",
+  "generator": {
+    "algorithm": "sha256-first-byte-low-bit-v1",
+    "input": "decoded seed bytes followed by the one-byte block number (1 through 6)",
+    "bit_0": [
+      "AB",
+      "BA"
+    ],
+    "bit_1": [
+      "BA",
+      "AB"
+    ]
+  },
+  "pairs": [
+    {
+      "pair_id": "pair-01",
+      "sequence": 1,
+      "block": 1,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-02",
+      "sequence": 2,
+      "block": 1,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pair_id": "pair-03",
+      "sequence": 3,
+      "block": 2,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pair_id": "pair-04",
+      "sequence": 4,
+      "block": 2,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-05",
+      "sequence": 5,
+      "block": 3,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pair_id": "pair-06",
+      "sequence": 6,
+      "block": 3,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-07",
+      "sequence": 7,
+      "block": 4,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-08",
+      "sequence": 8,
+      "block": 4,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pair_id": "pair-09",
+      "sequence": 9,
+      "block": 5,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pair_id": "pair-10",
+      "sequence": 10,
+      "block": 5,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-11",
+      "sequence": 11,
+      "block": 6,
+      "planned_order": "AB",
+      "arms": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pair_id": "pair-12",
+      "sequence": 12,
+      "block": 6,
+      "planned_order": "BA",
+      "arms": [
+        "B",
+        "A"
+      ]
+    }
+  ]
+}

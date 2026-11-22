@@ -57,6 +57,15 @@ async function compose(...args) {
   return (await command).stdout.trim();
 }
 
+async function readFaultFlag() {
+  const state = await compose('exec', '-T', 'candidate', 'sh', '-c',
+    'if test -e "$1"; then printf present; else printf absent; fi', 'sh', faultFlag);
+  if (state !== 'present' && state !== 'absent') {
+    throw new Error('Could not read the candidate fault flag state');
+  }
+  return state;
+}
+
 function composeServices(output) {
   // Compose versions emit either a JSON array or one JSON object per line.
   const rows = output.startsWith('[')
@@ -97,11 +106,7 @@ async function checkPreflight(checks) {
     }
   }
 
-  const flagState = await compose('exec', '-T', 'candidate', 'sh', '-c',
-    'if test -e "$1"; then printf present; else printf absent; fi', 'sh', faultFlag);
-  if (flagState !== 'present' && flagState !== 'absent') {
-    throw new Error('Could not read the candidate fault flag state');
-  }
+  const flagState = await readFaultFlag();
   checks.candidate_fault_flag = flagState;
   if (flagState === 'present') throw new Error('The candidate fault flag must be absent');
 
@@ -120,7 +125,7 @@ try {
     report.status = 'PREFLIGHT_PASSED';
   } else {
     report.event = 'paired_pilot';
-    await runPilot(report, { repoRoot, resultsDir, faultFlag, compose, checkPreflight });
+    await runPilot(report, { repoRoot, resultsDir, faultFlag, compose, checkPreflight, readFaultFlag });
   }
 } catch (error) {
   report.status = report.event === 'paired_pilot' ? 'TRIAL_FAILED' : 'PREFLIGHT_FAILED';

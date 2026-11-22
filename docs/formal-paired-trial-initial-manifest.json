@@ -1,0 +1,235 @@
+{
+  "schema_version": 2,
+  "schedule_id": "formal-paired-trials-v1",
+  "status": "proposed",
+  "pairs": [
+    {
+      "pair_id": "pair-01",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-01-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-01-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-02",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-02-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-02-r01-a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-03",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-03-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-03-r01-a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-04",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-04-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-04-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-05",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-05-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-05-r01-a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-06",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-06-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-06-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-07",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-07-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-07-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-08",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-08-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-08-r01-a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-09",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-09-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-09-r01-a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-10",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-10-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-10-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-11",
+      "assigned_order": "AB",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "A",
+              "trial_id": "pair-11-r01-a"
+            },
+            {
+              "arm": "B",
+              "trial_id": "pair-11-r01-b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pair_id": "pair-12",
+      "assigned_order": "BA",
+      "rounds": [
+        {
+          "round_id": "round-01",
+          "attempts": [
+            {
+              "arm": "B",
+              "trial_id": "pair-12-r01-b"
+            },
+            {
+              "arm": "A",
+              "trial_id": "pair-12-r01-a"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

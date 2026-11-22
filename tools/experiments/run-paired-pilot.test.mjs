@@ -27,7 +27,7 @@ async function fixture(t) {
   for (const name of ['deployment-state.mjs', 'nginx-routing.mjs', 'observe-proxy.mjs']) {
     await copyFile(new URL('../controller/' + name, import.meta.url), join(controllers, name));
   }
-  for (const name of ['run-paired-pilot.mjs', 'pilot-process.mjs', 'pilot-trial.mjs']) {
+  for (const name of ['run-paired-pilot.mjs', 'pilot-process.mjs', 'pilot-trial.mjs', 'trial-clock-sampler.mjs']) {
     await copyFile(new URL(name, import.meta.url), join(experiments, name));
   }
   const cli = join(experiments, 'run-paired-pilot.mjs');
@@ -39,12 +39,16 @@ async function fixture(t) {
   await writeFile(configPath, stableConfig);
   await writeFile(statePath, JSON.stringify(emptyRouting));
   await writeFile(preload, `
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import timers from 'node:timers/promises';
 import { syncBuiltinESMExports } from 'node:module';
 const sleep = timers.setTimeout;
 timers.setTimeout = async (ms, value, options) => {
+  if (process.env.PILOT_TRIAL_MODE === 'interrupted-before-cutoff' &&
+      ms !== 15000 && options?.signal && existsSync(join(process.env.PILOT_FIXTURE, 'driver-finished'))) {
+    setTimeout(() => process.kill(process.pid, 'SIGINT'), 0);
+  }
   if (ms !== 15000 || !process.env.PILOT_TRIAL_MODE) return sleep(ms, value, options);
   while (!existsSync(join(process.env.PILOT_FIXTURE, 'driver-ready'))) {
     await sleep(5, undefined, options);
@@ -52,8 +56,29 @@ timers.setTimeout = async (ms, value, options) => {
   return value;
 };
 syncBuiltinESMExports();
-globalThis.fetch = async url => {
+globalThis.fetch = async (url, { signal } = {}) => {
   if (url !== 'http://127.0.0.1:8080/api/work') throw new Error('Unexpected proxy URL');
+  const root = process.env.PILOT_FIXTURE;
+  if (existsSync(join(root, 'driver-finished')) && !existsSync(join(root, 'cleanup-complete'))) {
+    const candidate = readFileSync(join(root, 'runtime/nginx/conf.d/default.conf'), 'utf8').includes('candidate:3000');
+    writeFileSync(join(root, 'cutoff-probed'), '');
+    if (process.env.PILOT_TRIAL_MODE === 'interrupted-during-probe') {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Fixture did not receive SIGINT')), 1000);
+        process.once('SIGINT', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        process.kill(process.pid, 'SIGINT');
+      });
+    }
+    if (process.env.PILOT_TRIAL_MODE === 'probe-timeout') {
+      try { await sleep(5000, undefined, { signal }); } catch (error) { throw signal.reason ?? error; }
+    }
+    return new Response(JSON.stringify({ version: candidate ? '2.0.0' : '1.0.0' }), {
+      status: candidate ? 500 : 200
+    });
+  }
   const version = process.env.PILOT_TRIAL_MODE === 'reset-failed' &&
     existsSync(join(process.env.PILOT_FIXTURE, 'monitor-finished')) ? '2.0.0' : process.env.PILOT_PROXY_VERSION;
   return new Response(JSON.stringify({ version }), { status: 200 });
@@ -81,10 +106,22 @@ if (command[0] === 'ps') {
   assert.deepEqual(command, ['exec', '-T', 'candidate', 'rm', '-f', '/tmp/health-aware-workload-fault']);
   assert.ok(existsSync(join(root, 'driver-finished')), 'cleanup preceded driver exit');
   rmSync(flag, { force: true });
+  writeFileSync(join(root, 'cleanup-complete'), '');
 } else {
   assert.deepEqual(command, ['exec', '-T', 'candidate', 'sh', '-c',
     'if test -e "$1"; then printf present; else printf absent; fi',
     'sh', '/tmp/health-aware-workload-fault']);
+  if (existsSync(join(root, 'driver-finished')) && !existsSync(join(root, 'cleanup-complete'))) {
+    if (process.env.PILOT_TRIAL_MODE === 'fault-flag-check-failed') {
+      console.error('fixture could not inspect the fault flag');
+      process.exit(1);
+    }
+    if (process.env.PILOT_TRIAL_MODE === 'fault-flag-unexpected-output') {
+      console.log('unknown');
+      process.exit(0);
+    }
+    if (process.env.PILOT_TRIAL_MODE === 'fault-flag-absent') rmSync(flag, { force: true });
+  }
   console.log(existsSync(flag) ? 'present' : process.env.PILOT_FAULT);
 }
 `, { mode: 0o700 });
@@ -219,6 +256,7 @@ console.log(JSON.stringify({ status: 'PROMOTED', deployment_id: id }));
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { id, arm, mode, deployPath, configPath, statePath, load, save, timestamp, waitFor } from '../fixture-state.mjs';
 assert.deepEqual(process.argv.slice(2), arm === 'B' ? ['--operator-delay-ms', '10000', id] : [id]);
 await waitFor('candidate-fault');
@@ -232,7 +270,13 @@ if (arm === 'B') {
     status: 'OPERATOR_DELAY_STARTED', deployment_id: id, confirmed_at: first, first_failure_probe_at: first
   }));
 }
-if (mode === 'rollback-failed') {
+if (mode === 'monitor-crashed') {
+  writeFileSync('monitor-finished', '');
+  process.exit(1);
+}
+if (mode === 'monitor-active-at-cutoff') await waitFor('cutoff-probed');
+if (mode.startsWith('interrupted-') ||
+    ['rollback-failed', 'monitor-active-at-cutoff', 'probe-timeout'].includes(mode)) {
   console.log(JSON.stringify({
     status: 'ROLLBACK_FAILED', deployment_id: id, confirmed_at: first, first_failure_probe_at: first,
     recovery: { started_at: first, failed_step: 'NGINX_RELOAD', proxy_verified: false }
@@ -240,23 +284,31 @@ if (mode === 'rollback-failed') {
   writeFileSync('monitor-finished', '');
   process.exit(1);
 }
+let verifiedAt = Date.now();
+if (mode.startsWith('cutoff-')) {
+  verifiedAt = load('driver-start.json') + Number(mode.slice('cutoff-'.length));
+  while (Date.now() < verifiedAt) await sleep(verifiedAt - Date.now());
+}
 writeFileSync(configPath, readFileSync(join(deployPath, 'previous-nginx.conf')));
-save(statePath, { deployment_id: null, pending_deployment_id: null });
+if (mode !== 'finalization-failed') save(statePath, { deployment_id: null, pending_deployment_id: null });
 const recovery = {
-  started_at: first, verified_at: timestamp(), proxy_verified: true,
+  started_at: first, verified_at: new Date(verifiedAt).toISOString(), proxy_verified: true,
   verification: { consecutive: 3 }, last_proxy_observation: { http_status: 200, version: '1.0.0' }
 };
 const path = join(deployPath, 'deployment.json');
 save(path, { ...load(path), status: 'RECOVERY_VERIFIED_PENDING_FINALIZATION', rollback: recovery });
 console.log(JSON.stringify({
-  status: 'ROLLED_BACK', deployment_id: id, confirmed_at: first, first_failure_probe_at: first, recovery
+  status: mode === 'finalization-failed' ? 'FINALIZATION_FAILED' : 'ROLLED_BACK',
+  deployment_id: id, confirmed_at: first, first_failure_probe_at: first, recovery
 }));
 writeFileSync('monitor-finished', '');
+if (mode === 'finalization-failed') process.exit(1);
 `);
   await writeFile(join(drivers, 'driver.js'), `
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { mode, save, waitFor } from '../fixture-state.mjs';
 const args = process.argv.slice(2);
 const trialId = args.at(-1);
@@ -266,9 +318,17 @@ assert.deepEqual(args, [
 ]);
 const runDir = join('experiments/results', trialId);
 assert.equal(existsSync(runDir), false, 'Driver directory was reserved too early');
-const start = Date.now();
+if (mode === 'driver-exits-before-fault') process.exit(1);
+const cutoffFixture = mode.startsWith('cutoff-') || mode.startsWith('interrupted-') ||
+  ['rollback-failed', 'monitor-crashed', 'monitor-active-at-cutoff', 'probe-timeout'].includes(mode);
+const start = Date.now() - (cutoffFixture ? 58_500 : 0);
+save('driver-start.json', start);
 writeFileSync('driver-ready', '');
-await waitFor('monitor-finished');
+await waitFor(mode === 'monitor-active-at-cutoff' ? 'candidate-fault' : 'monitor-finished');
+if (mode === 'rollback-failed') {
+  const completion = start + 59_805;
+  while (Date.now() < completion) await sleep(completion - Date.now());
+}
 assert.ok(existsSync('candidate-fault'), 'Fault cleared before driver completed');
 writeFileSync('driver-finished', '');
 if (mode === 'driver-no-output') {
@@ -289,8 +349,21 @@ console.log('{"ok":300}');
 for (const [mode, arm, expected] of [
   ['normal', 'A', 'TRIAL_PASSED'],
   ['rollback-failed', 'B', 'TRIAL_FAILED'],
+  ['monitor-active-at-cutoff', 'A', 'TRIAL_FAILED'],
+  ['probe-timeout', 'A', 'TRIAL_FAILED'],
+  ['monitor-crashed', 'A', 'TRIAL_FAILED'],
+  ['interrupted-before-cutoff', 'A', 'TRIAL_FAILED'],
+  ['interrupted-during-probe', 'A', 'TRIAL_FAILED'],
+  ['finalization-failed', 'A', 'TRIAL_FAILED'],
+  ['fault-flag-absent', 'A', 'TRIAL_PASSED'],
+  ['fault-flag-check-failed', 'A', 'TRIAL_PASSED'],
+  ['fault-flag-unexpected-output', 'A', 'TRIAL_PASSED'],
+  ['cutoff-59999', 'A', 'TRIAL_PASSED'],
+  ['cutoff-60000', 'A', 'TRIAL_FAILED'],
+  ['cutoff-60025', 'A', 'TRIAL_FAILED'],
   ['driver-no-output', 'A', 'TRIAL_FAILED'],
   ['driver-incomplete', 'A', 'TRIAL_FAILED'],
+  ['driver-exits-before-fault', 'A', 'TRIAL_FAILED'],
   ['reset-failed', 'A', 'TRIAL_FAILED'],
   ['promotion-failed', 'A', 'TRIAL_FAILED']
 ]) {
@@ -310,13 +383,37 @@ for (const [mode, arm, expected] of [
     const markers = recorded.map(row => row[2]);
     const times = recorded.map(row => Number(row[3]));
     assert.deepEqual(times, times.toSorted((a, b) => a - b));
+    const clockPath = join(report.run_dir, 'clock-samples.jsonl');
     if (mode === 'promotion-failed') {
       assert.equal(markers.includes('driver_spawned'), false);
       assert.equal(existsSync(join(report.run_dir, 'requests.csv')), false);
       assert.equal(existsSync(join(report.run_dir, 'run.json')), false);
+      assert.equal(existsSync(clockPath), false);
+      assert.equal(report.clock_trace, undefined);
       assert.match(await readFile(join(report.run_dir, 'promotion.json'), 'utf8'), /PROMOTION_BLOCKED/);
       return;
     }
+
+    const clockSamples = (await readFile(clockPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(clockSamples.length > 0);
+    for (const [index, sample] of clockSamples.entries()) {
+      assert.deepEqual(Object.keys(sample).sort(), ['monotonic_ms', 'wall_ms']);
+      assert.ok(Number.isSafeInteger(sample.wall_ms));
+      assert.ok(Number.isFinite(sample.monotonic_ms) && sample.monotonic_ms >= 0);
+      if (index > 0) assert.ok(sample.monotonic_ms > clockSamples[index - 1].monotonic_ms);
+    }
+    if (mode === 'driver-exits-before-fault') {
+      assert.equal(report.driver_process.exit_code, 1);
+      assert.equal(markers.includes('driver_spawned'), true);
+      assert.equal(markers.includes('fault_activation_started'), false);
+      assert.equal(report.observation, undefined);
+      assert.deepEqual(report.clock_trace, { cleanup_start_sampled: false });
+      return;
+    }
+
+    assert.deepEqual(report.clock_trace, { cleanup_start_sampled: true });
+    assert.ok(clockSamples.length >= 2);
+    assert.equal(clockSamples.at(-1).wall_ms, report.observation.cleanup_started_ms);
 
     assert.equal(existsSync(join(lab.root, 'candidate-fault')), false);
     assert.equal(report.driver_process.exit_code, mode.startsWith('driver-') ? 1 : 0);
@@ -324,6 +421,7 @@ for (const [mode, arm, expected] of [
     assert.ok(markers.includes('fault_activated'));
     assert.ok(markers.includes('fault_cleared'));
     const controller = (await readFile(join(report.run_dir, 'controller.jsonl'), 'utf8')).trim().split('\n')
+      .filter(Boolean)
       .map(line => JSON.parse(line));
     if (mode === 'driver-no-output') {
       assert.equal(existsSync(join(report.run_dir, 'requests.csv')), false);
@@ -332,6 +430,8 @@ for (const [mode, arm, expected] of [
     } else {
       assert.equal(await readFile(join(report.run_dir, 'requests.csv'), 'utf8'), 'fixture driver rows\n');
       const start = JSON.parse(await readFile(join(report.run_dir, 'run.json'), 'utf8')).wall_start_ms;
+      // Cutoff fixtures intentionally backdate the workload start to shorten the test.
+      if (mode === 'normal') assert.ok(clockSamples[0].wall_ms <= start);
       const timestamp = name => times[markers.indexOf(name)];
       assert.deepEqual(report.fault_offset_ms, {
         started: timestamp('fault_activation_started') - start,
@@ -345,18 +445,119 @@ for (const [mode, arm, expected] of [
 
     const state = JSON.parse(await readFile(lab.statePath, 'utf8'));
     assert.deepEqual(JSON.parse(await readFile(join(report.run_dir, 'active-deployment.json'), 'utf8')), state);
-    if (mode === 'rollback-failed') {
-      assert.deepEqual(controller.map(event => event.status), ['OPERATOR_DELAY_STARTED', 'ROLLBACK_FAILED']);
+    const { observation } = report;
+    if (mode.startsWith('interrupted-')) {
+      assert.equal(observation.fault_flag_present_at_cleanup, null);
+      assert.equal(observation.fault_flag_checked_at_ms, null);
+      assert.equal(observation.fault_flag_check_error, null);
+    } else {
+      assert.ok(Number.isInteger(observation.fault_flag_checked_at_ms));
+      assert.ok(observation.fault_flag_checked_at_ms <= observation.cleanup_started_ms);
+      if (mode === 'fault-flag-check-failed') {
+        assert.equal(observation.fault_flag_present_at_cleanup, null);
+        assert.match(observation.fault_flag_check_error, /fixture could not inspect the fault flag/);
+      } else if (mode === 'fault-flag-unexpected-output') {
+        assert.equal(observation.fault_flag_present_at_cleanup, null);
+        assert.equal(observation.fault_flag_check_error, 'Could not read the candidate fault flag state');
+      } else {
+        assert.equal(observation.fault_flag_present_at_cleanup, mode !== 'fault-flag-absent');
+        assert.equal(observation.fault_flag_check_error, null);
+      }
+    }
+    if (observation.final_observation) {
+      const probe = observation.final_observation;
+      assert.equal(observation.final_observation_skip_reason, null);
+      assert.ok(probe.started_at_ms >= observation.cutoff_ms);
+      assert.equal(observation.final_observation_lateness_ms, probe.started_at_ms - observation.cutoff_ms);
+      assert.ok(probe.completed_at_ms >= probe.started_at_ms);
+      assert.ok(probe.completed_at_ms <= observation.cleanup_started_ms);
+      if (observation.fault_flag_checked_at_ms !== null) {
+        assert.ok(probe.completed_at_ms <= observation.fault_flag_checked_at_ms);
+      }
+    } else {
+      assert.equal(observation.final_observation_lateness_ms, null);
+    }
+    if (['rollback-failed', 'monitor-active-at-cutoff', 'probe-timeout', 'interrupted-during-probe'].includes(mode)) {
+      assert.deepEqual(controller.map(event => event.status), arm === 'B'
+        ? ['OPERATOR_DELAY_STARTED', 'ROLLBACK_FAILED'] : ['ROLLBACK_FAILED']);
       assert.equal(state.deployment_id, report.deployment_id);
       assert.match(await readFile(lab.configPath, 'utf8'), /candidate:3000/);
       assert.ok(report.failures.some(item => item.step === 'reset'));
       assert.equal(markers.filter(marker => marker === 'reset_verified').length, 1);
+      assert.ok(report.driver_process.exited_at_ms < observation.cutoff_ms);
+      assert.ok(observation.cleanup_started_ms >= observation.cutoff_ms);
+      assert.equal(observation.runner_cleanup_deferred_through_cutoff, true);
+      assert.equal(observation.terminal_rollback_failure, true);
+      assert.equal(observation.recovery_verified_in_window, false);
+      assert.equal(observation.verified_at_ms, null);
+      const probe = observation.final_observation;
+      if (mode === 'monitor-active-at-cutoff') {
+        assert.ok(probe.started_at_ms < report.monitor_process.exited_at_ms);
+      } else {
+        assert.ok(report.monitor_process.exited_at_ms < observation.cutoff_ms);
+      }
+      if (mode === 'probe-timeout') {
+        assert.equal(probe.http_status, null);
+        assert.equal(probe.version, null);
+        assert.match(probe.error, /timeout/i);
+      } else {
+        assert.equal(probe.http_status, 500);
+        assert.equal(probe.version, '2.0.0');
+        assert.equal(probe.error, null);
+      }
+      if (mode === 'interrupted-during-probe') {
+        assert.ok(report.failures.some(item => item.step === 'interrupted'));
+        assert.ok(observation.interrupted_at_ms >= probe.started_at_ms);
+        assert.ok(observation.interrupted_at_ms <= probe.completed_at_ms);
+      }
+    } else if (mode === 'monitor-crashed') {
+      assert.equal(controller.length, 0);
+      assert.ok(report.monitor_process.exited_at_ms < report.observation.cutoff_ms);
+      assert.ok(report.observation.cleanup_started_ms >= report.observation.cutoff_ms);
+      assert.equal(report.observation.runner_cleanup_deferred_through_cutoff, true);
+      assert.equal(report.observation.terminal_rollback_failure, false);
+      assert.equal(observation.recovery_verified_in_window, false);
+      assert.equal(observation.final_observation.http_status, 500);
+    } else if (mode === 'interrupted-before-cutoff') {
+      assert.ok(report.failures.some(item => item.step === 'interrupted'));
+      assert.ok(report.observation.interrupted_at_ms < report.observation.cutoff_ms);
+      assert.equal(report.observation.runner_cleanup_deferred_through_cutoff, false);
+      assert.equal(observation.recovery_verified_in_window, false);
+      assert.equal(observation.final_observation, null);
+      assert.equal(observation.final_observation_skip_reason, 'trial_interrupted');
+    } else if (mode === 'finalization-failed') {
+      assert.equal(controller.at(-1).status, 'FINALIZATION_FAILED');
+      assert.equal(state.deployment_id, report.deployment_id);
+      assert.equal(observation.recovery_verified_in_window, true);
+      assert.ok(report.observation.verified_at_ms < report.observation.cutoff_ms);
     } else {
       assert.equal(state.deployment_id, null);
       assert.equal(controller.at(-1).status, 'ROLLED_BACK');
       assert.equal(await readFile(lab.configPath, 'utf8'), stableConfig);
       assert.equal(markers.filter(marker => marker === 'reset_verified').length, mode === 'reset-failed' ? 1 : 2);
       if (mode === 'reset-failed') assert.ok(report.failures.some(item => item.step === 'reset'));
+    }
+    if (mode.startsWith('cutoff-')) {
+      assert.equal(observation.recovery_verified_in_window, mode === 'cutoff-59999');
+      assert.equal(observation.verified_at_ms - observation.cutoff_ms, Number(mode.slice('cutoff-'.length)) - 60_000);
+      if (mode !== 'cutoff-59999') {
+        assert.equal(observation.runner_cleanup_deferred_through_cutoff, true);
+        assert.ok(observation.final_observation.started_at_ms >= observation.verified_at_ms);
+        assert.equal(observation.final_observation.http_status, 200);
+        assert.equal(observation.final_observation.version, '1.0.0');
+      }
+      assert.equal(report.failures.some(item => item.step === 'timeline'), mode !== 'cutoff-59999');
+    }
+    if (['normal', 'finalization-failed', 'cutoff-59999', 'fault-flag-absent', 'fault-flag-check-failed',
+      'fault-flag-unexpected-output'].includes(mode)) {
+      assert.equal(observation.recovery_verified_in_window, true);
+      assert.equal(observation.final_observation, null);
+      assert.equal(observation.final_observation_skip_reason, 'verified_in_window');
+    }
+    if (mode.startsWith('driver-')) {
+      assert.equal(observation.cutoff_ms, null);
+      assert.equal(observation.final_observation, null);
+      assert.equal(observation.final_observation_skip_reason, 'driver_evidence_unavailable');
     }
   });
 }

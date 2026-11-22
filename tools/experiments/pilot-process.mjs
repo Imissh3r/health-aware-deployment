@@ -16,10 +16,12 @@ export function startPilotProcess({ cwd, stagingDir, args, stdout, stderr, signa
   }
 
   let stopReason;
+  let stopRequestedAt;
   let forceTimer;
   function stop(reason) {
     if (stopReason || child.exitCode !== null || child.signalCode !== null) return;
     stopReason = reason;
+    stopRequestedAt = Date.now();
     child.kill('SIGTERM');
     forceTimer = setTimeout(() => child.kill('SIGKILL'), 3000);
     forceTimer.unref();
@@ -32,7 +34,9 @@ export function startPilotProcess({ cwd, stagingDir, args, stdout, stderr, signa
   let result;
   const finished = new Promise(resolve => {
     let spawnError;
+    let exitedAt;
     child.once('error', error => { spawnError = error.message; });
+    child.once('exit', () => { exitedAt = Date.now(); });
     child.once('close', (exitCode, exitSignal) => {
       clearTimeout(timeoutTimer);
       clearTimeout(forceTimer);
@@ -40,8 +44,9 @@ export function startPilotProcess({ cwd, stagingDir, args, stdout, stderr, signa
       result = {
         exit_code: exitCode,
         signal: exitSignal,
+        exited_at_ms: exitedAt ?? null,
         ...(spawnError ? { error: spawnError } : {}),
-        ...(stopReason ? { stop_reason: stopReason } : {})
+        ...(stopReason ? { stop_reason: stopReason, stop_requested_at_ms: stopRequestedAt } : {})
       };
       resolve(result);
     });

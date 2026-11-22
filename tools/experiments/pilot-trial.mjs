@@ -6,12 +6,15 @@ import {
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { deploymentsPath, readDeploymentManifest, writeAtomic } from '../controller/deployment-state.mjs';
+import { observeProxy } from '../controller/observe-proxy.mjs';
 import { startPilotProcess } from './pilot-process.mjs';
+import { startTrialClockSampler } from './trial-clock-sampler.mjs';
 
 const workloadUrl = 'http://127.0.0.1:8080/api/work';
 const durationMs = 60_000;
 const faultDelayMs = 15_000;
 const operatorDelayMs = 10_000;
+const finalObservationTimeoutMs = 1000;
 
 function lockTrial(resultsDir) {
   // The runner lock is separate from the controller's routing lock.
@@ -48,12 +51,14 @@ function collectDriver(report, record) {
   report.driver_review_required = driver.review_required;
   if (Number.isFinite(driver.wall_start_ms)) record('driver_started', driver.wall_start_ms, 'driver');
   if (driver.run_id !== report.trial_id || driver.status !== 'complete' ||
+      !Number.isSafeInteger(driver.wall_start_ms) || driver.wall_start_ms < 0 || driver.wall_start_ms > Date.now() ||
       driver.summary?.offered !== 300 || driver.review_required ||
       !Object.values(driver.invariants ?? {}).length ||
       Object.values(driver.invariants).some(value => value !== true) ||
       !existsSync(join(report.run_dir, 'requests.csv'))) {
     throw new Error('Driver results are incomplete or need review');
   }
+  return driver.wall_start_ms;
 }
 
 function collectController(report, record) {
@@ -85,13 +90,51 @@ function collectController(report, record) {
     if (Number.isFinite(time)) record(event, time, 'controller');
   }
   report.controller_status = terminal?.status ?? null;
-  if (malformed || terminal?.deployment_id !== report.deployment_id ||
-      terminal.status !== 'ROLLED_BACK' || terminal.recovery?.proxy_verified !== true ||
-      terminal.recovery?.verification?.consecutive !== 3 ||
-      terminal.recovery?.last_proxy_observation?.version !== '1.0.0' ||
-      terminal.recovery?.last_proxy_observation?.http_status !== 200) {
-    throw new Error('Controller evidence does not verify rollback to stable 1.0.0');
+  const trusted = !malformed && terminal?.deployment_id === report.deployment_id;
+  const verifiedAt = Date.parse(terminal?.recovery?.verified_at);
+  const verified = trusted && ['ROLLED_BACK', 'FINALIZATION_FAILED'].includes(terminal.status) &&
+    Number.isSafeInteger(verifiedAt) && terminal.recovery?.proxy_verified === true &&
+    terminal.recovery.verification?.consecutive === 3 &&
+    terminal.recovery.last_proxy_observation?.version === '1.0.0' &&
+    terminal.recovery.last_proxy_observation?.http_status === 200;
+  const outcome = report.monitor_process;
+  const rollbackFailed = trusted && terminal.status === 'ROLLBACK_FAILED' &&
+    terminal.recovery?.proxy_verified === false && typeof terminal.recovery.failed_step === 'string' &&
+    outcome.exit_code === 1 && !outcome.error && !outcome.signal && !outcome.stop_reason;
+  return {
+    rolledBack: verified && terminal.status === 'ROLLED_BACK',
+    verifiedAt: verified ? verifiedAt : null,
+    rollbackFailed
+  };
+}
+
+async function sampleAtCutoff(cutoff, monitorEvidence, recoveredInWindow, signal) {
+  if (recoveredInWindow()) return null;
+  signal.throwIfAborted();
+  const remaining = cutoff - Date.now();
+  if (remaining > durationMs) throw new Error('Wall clock moved before the workload start');
+  if (remaining > 0) {
+    const timer = new AbortController();
+    const wait = sleep(remaining + 1, undefined, { signal: AbortSignal.any([timer.signal, signal]) });
+    try {
+      // Early monitor exit only shortens the wait when recovery was verified in-window.
+      await Promise.race([wait, monitorEvidence.then(() => recoveredInWindow() ? undefined : wait)]);
+    } finally {
+      timer.abort();
+    }
   }
+  if (recoveredInWindow()) return null;
+  signal.throwIfAborted();
+  const startedAt = Date.now();
+  if (startedAt < cutoff) throw new Error('Wall clock was still before the observation cutoff after waiting');
+  const result = await observeProxy(finalObservationTimeoutMs, { url: workloadUrl, versionStatuses: [200, 500] });
+  return {
+    started_at_ms: startedAt,
+    completed_at_ms: Date.now(),
+    http_status: result.http_status,
+    version: typeof result.version === 'string' ? result.version : null,
+    error: result.error ?? null
+  };
 }
 
 function checkTimeline(report, events) {
@@ -150,8 +193,10 @@ function publishEvidence(report, driverStarted) {
   rmSync(report.staging_dir, { recursive: true });
 }
 
-export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compose, checkPreflight }) {
+export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compose, checkPreflight, readFaultFlag }) {
   const stage = report.staging_dir;
+  const runnerWallStart = Date.now();
+  const runnerMonotonicStart = performance.now();
   const events = [];
   report.failures = [];
   const failure = (step, error) => report.failures.push({ step, reason: error.message });
@@ -163,7 +208,11 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
   }
 
   const stop = new AbortController();
-  const interrupt = () => stop.abort(new Error('Trial interrupted'));
+  let interruptedAt = null;
+  const interrupt = () => {
+    interruptedAt ??= Date.now();
+    stop.abort(new Error('Trial interrupted'));
+  };
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   const start = (args, stdout, stderr, timeout = 75_000) =>
@@ -174,8 +223,9 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
   let promotion;
   let driver;
   let monitor;
+  let clockSampler;
   let faultAttempted = false;
-  let faultSucceeded = false;
+  let faultAcknowledgedAt = null;
   try {
     try {
       record('trial_start', Date.parse(report.started_at));
@@ -216,6 +266,7 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
       const monitorArgs = ['tools/controller/monitor.mjs'];
       if (report.arm === 'B') monitorArgs.push('--operator-delay-ms', String(operatorDelayMs));
       monitor = start([...monitorArgs, report.deployment_id], 'controller.jsonl', 'controller.stderr.log');
+      clockSampler = startTrialClockSampler();
       driver = start([
         'tools/driver/driver.js', '--url', workloadUrl, '--rate', '5', '--duration', '60',
         '--warmup', '5', '--timeout', '3000', '--out', resultsDir, '--run-id', report.trial_id
@@ -246,30 +297,103 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
       record('fault_activation_started');
       faultAttempted = true;
       await compose('exec', '-T', 'candidate', 'touch', faultFlag);
-      faultSucceeded = true;
-      record('fault_activated');
+      faultAcknowledgedAt = Date.now();
+      record('fault_activated', faultAcknowledgedAt);
     } catch (error) {
       failure(step, error);
     } finally {
+      let controller;
+      let cutoff = null;
+      let faultInWindow = false;
+      let finalObservation = null;
+      let finalObservationSkipReason = 'driver_evidence_unavailable';
+      if (monitor && faultAcknowledgedAt === null) monitor.stop('Trial stopped before confirming fault activation');
+      const monitorEvidence = Promise.resolve(monitor?.finished).then(result => {
+        if (!result) return;
+        report.monitor_process = result;
+        if (!succeeded(result)) {
+          failure('monitor_process', new Error(result.error ?? result.stop_reason ?? 'Monitor exited unsuccessfully'));
+        }
+        try {
+          controller = collectController(report, record);
+          if (!controller.rolledBack) {
+            throw new Error('Controller evidence does not verify a completed rollback to stable 1.0.0');
+          }
+        } catch (error) {
+          failure('controller_evidence', error);
+        }
+      });
       try {
-        if (monitor && !faultSucceeded) monitor.stop('Trial stopped before confirming fault activation');
-        const [driverResult, monitorResult] = await Promise.all([driver?.finished, monitor?.finished]);
+        let driverStart = null;
+        const driverResult = await driver?.finished;
         if (driverResult) {
           report.driver_process = driverResult;
           if (!succeeded(driverResult)) {
             failure('driver_process', new Error(driverResult.error ?? driverResult.stop_reason ?? 'Driver exited unsuccessfully'));
           }
-          try { collectDriver(report, record); } catch (error) { failure('driver_evidence', error); }
-        }
-        if (monitorResult) {
-          report.monitor_process = monitorResult;
-          if (!succeeded(monitorResult)) {
-            failure('monitor_process', new Error(monitorResult.error ?? monitorResult.stop_reason ?? 'Monitor exited unsuccessfully'));
+          try {
+            const startTime = collectDriver(report, record);
+            if (succeeded(driverResult)) driverStart = startTime;
+          } catch (error) {
+            failure('driver_evidence', error);
           }
-          try { collectController(report, record); } catch (error) { failure('controller_evidence', error); }
+        }
+        cutoff = driverStart === null ? null : driverStart + durationMs;
+        faultInWindow = cutoff !== null && faultAcknowledgedAt !== null &&
+          faultAcknowledgedAt >= driverStart && faultAcknowledgedAt < cutoff;
+        if (faultInWindow) {
+          const recoveredInWindow = () => controller?.verifiedAt != null &&
+            controller.verifiedAt >= faultAcknowledgedAt && controller.verifiedAt < cutoff;
+          try {
+            finalObservation = await sampleAtCutoff(cutoff, monitorEvidence, recoveredInWindow, stop.signal);
+            finalObservationSkipReason = finalObservation === null ? 'verified_in_window' : null;
+          } catch (error) {
+            finalObservationSkipReason = stop.signal.aborted ? 'trial_interrupted' : 'observation_wait_failed';
+            if (!stop.signal.aborted) failure('observation_wait', error);
+          }
+        } else if (cutoff !== null) {
+          finalObservationSkipReason = faultAcknowledgedAt === null ? 'fault_not_acknowledged' : 'fault_outside_window';
         }
       } finally {
+        await monitorEvidence;
         if (faultAttempted) {
+          let flagPresent = null;
+          let flagCheckedAt = null;
+          let flagCheckError = null;
+          if (!stop.signal.aborted) {
+            try {
+              flagPresent = (await readFaultFlag()) === 'present';
+            } catch (error) {
+              flagCheckError = error.message;
+            }
+            flagCheckedAt = Date.now();
+          }
+
+          const cleanupStarted = clockSampler.stop({ atCleanupStart: true }).wall_ms;
+          const cleanupDeferredThroughCutoff = faultInWindow && cleanupStarted >= cutoff &&
+            (interruptedAt === null || interruptedAt >= cutoff);
+          const verifiedAt = controller?.verifiedAt ?? null;
+          const recoveryVerifiedInWindow = faultInWindow && verifiedAt !== null &&
+            verifiedAt >= faultAcknowledgedAt && verifiedAt < cutoff && verifiedAt <= cleanupStarted &&
+            (interruptedAt === null || verifiedAt <= interruptedAt);
+          // A single proxy sample does not substitute for verified recovery.
+          report.observation = {
+            cutoff_ms: cutoff,
+            cleanup_started_ms: cleanupStarted,
+            runner_cleanup_deferred_through_cutoff: cleanupDeferredThroughCutoff,
+            final_observation: finalObservation,
+            final_observation_lateness_ms: finalObservation === null ? null : finalObservation.started_at_ms - cutoff,
+            final_observation_skip_reason: finalObservationSkipReason,
+            fault_flag_present_at_cleanup: flagPresent,
+            fault_flag_checked_at_ms: flagCheckedAt,
+            fault_flag_check_error: flagCheckError,
+            verified_at_ms: verifiedAt,
+            recovery_verified_in_window: recoveryVerifiedInWindow,
+            terminal_rollback_failure: controller?.rollbackFailed ?? false,
+            interrupted_at_ms: interruptedAt,
+            runner_wall_elapsed_ms: cleanupStarted - runnerWallStart,
+            runner_monotonic_elapsed_ms: performance.now() - runnerMonotonicStart
+          };
           try {
             await compose('exec', '-T', 'candidate', 'rm', '-f', faultFlag);
             record('fault_cleared');
@@ -277,6 +401,7 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
             failure('fault_cleanup', error);
           }
         }
+        clockSampler?.stop();
         if (promotion) {
           report.reset_checks = {};
           try {
@@ -296,6 +421,15 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
     if (lockFd !== undefined) {
       try { archiveState(report); } catch (error) { failure('archive', error); }
     }
+    if (clockSampler) {
+      try {
+        const trace = clockSampler.samples.map(sample => JSON.stringify(sample)).join('\n') + '\n';
+        writeAtomic(join(stage, 'clock-samples.jsonl'), trace);
+        report.clock_trace = { cleanup_start_sampled: clockSampler.stop() !== null };
+      } catch (error) {
+        failure('clock_trace', error);
+      }
+    }
     const csv = ['trial_id,arm,event,wall_ms,source'];
     for (const event of events.sort((a, b) => a.wall_ms - b.wall_ms)) {
       csv.push([event.trial_id, event.arm, event.event, event.wall_ms, event.source].join(','));
@@ -312,6 +446,7 @@ export async function runPilot(report, { repoRoot, resultsDir, faultFlag, compos
       saveJson(stage, 'trial.json', report);
     }
   } finally {
+    clockSampler?.stop();
     if (lockFd !== undefined) closeSync(lockFd);
     process.removeListener('SIGINT', interrupt);
     process.removeListener('SIGTERM', interrupt);
