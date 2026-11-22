@@ -517,7 +517,9 @@ async function runExperiment(config, stopSignal, forceSignal) {
 
   const context = collectRunContext();
   const wallStartMs = Date.now();
+  const clockStartBeforeNs = process.hrtime.bigint();
   const start = performance.now();
+  const clockStartAfterNs = process.hrtime.bigint();
 
   try {
     await scheduleRequests(config, {
@@ -527,6 +529,9 @@ async function runExperiment(config, stopSignal, forceSignal) {
     onFatal(error);
   }
   await Promise.all(pending);
+  const clockEndBeforeNs = process.hrtime.bigint();
+  const clockEndMs = performance.now();
+  const clockEndAfterNs = process.hrtime.bigint();
 
   if (fatalError) {
     process.exitCode = 1;
@@ -599,6 +604,15 @@ async function runExperiment(config, stopSignal, forceSignal) {
     wall_start_ms: wallStartMs,
     wall_start_iso: new Date(wallStartMs).toISOString(),
 
+    clock_alignment: {
+      version: 1,
+      source: 'process.hrtime.bigint',
+      start_before_ns: clockStartBeforeNs.toString(),
+      start_after_ns: clockStartAfterNs.toString(),
+      end_before_ns: clockEndBeforeNs.toString(),
+      end_after_ns: clockEndAfterNs.toString(),
+      elapsed_ns: String(Math.round((clockEndMs - start) * 1e6))
+    },
     target_url: config.url,
 
     options: {
