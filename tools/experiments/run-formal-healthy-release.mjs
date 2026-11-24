@@ -30,7 +30,7 @@ async function waitUntil(deadline, signal) {
   }
 }
 
-function controllerResult(result, arm, cleanup = false) {
+export function controllerResult(result, arm, cleanup = false) {
   try {
     const parsed = JSON.parse(result.stdout);
     const allowed = cleanup ? ['RESTORED', 'FAILED'] : arm === 'H'
@@ -71,7 +71,7 @@ function parseRequests(text) {
   return records.map(row => Object.fromEntries(header.map((column, index) => [column, row[index]])));
 }
 
-function readWorkload(directory, runId) {
+export function readWorkload(directory, runId) {
   const files = {};
   for (const [key, name, parse] of [
     ['run', 'run.json', JSON.parse], ['requests', 'requests.csv', parseRequests]
@@ -436,7 +436,7 @@ export async function runFormalHealthyRelease({ arm, trialId, evidenceRoot, froz
   return result;
 }
 
-function command(file, args, timeout) {
+export function command(file, args, timeout) {
   return new Promise(resolve => {
     execFile(file, args, { cwd: root, timeout, maxBuffer: 2 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
       stdout, stderr, exitCode: error ? typeof error.code === 'number' ? error.code : null : 0,
@@ -489,7 +489,7 @@ function childProcess(args, onMessage) {
   return { child, finished };
 }
 
-function liveAdapters(frozen) {
+export function liveAdapters(frozen) {
   const now = () => process.hrtime.bigint();
   const compose = ['compose', '--profile', 'routing'];
   const url = new URL(frozen.proxyUrl);
@@ -567,13 +567,14 @@ function liveAdapters(frozen) {
         }
       };
     },
-    async restore(arm, owner, onControllerResult) {
+    async restore(arm, owner, onControllerResult, onInvoke) {
       if (arm === 'C') {
         const deployment = routing.readDeployment(owner);
         if (deployment.manifest.workflow !== 'conventional' ||
             sha256(deployment.previous) !== frozen.stableConfigSha256) {
           throw new Error('Conventional cleanup requires its frozen stable snapshot');
         }
+        onInvoke?.();
         const result = await controllerCommand(['tools/controller/conventional-release.mjs', 'restore', owner]);
         onControllerResult(result);
         const parsed = controllerResult(result, arm, true);
