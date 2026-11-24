@@ -113,16 +113,24 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
     const { monitorDeployment, deploymentId } = await fixture(t);
     const observations = [failed, failed, failed, healthy, failed, failed, failed, failed];
     const events = [];
+    const timing = [];
     const result = await monitorDeployment(deploymentId, {
       async observe() {
         assert.ok(observations.length > 0);
         return observations.shift();
       },
       recover: confirmOnly,
+      onDecisionTiming: event => timing.push(event),
       report: event => events.push([event.status, event.confirmation])
     });
     assert.equal(result, 'DEGRADATION_CONFIRMED');
+    await new Promise(resolve => setImmediate(resolve));
     assert.equal(observations.length, 0);
+    assert.deepEqual(timing.map(event => [event.event, event.source_observations.map(sample => sample.sequence)]), [
+      ['third_qualifying_failure', [1, 2, 3]],
+      ['third_qualifying_failure', [5, 6, 7]],
+      ['locked_degradation_confirmed', [5, 6, 7, 8]]
+    ]);
     assert.deepEqual(events, [['DEGRADATION_CLEARED', healthy], ['DEGRADATION_CONFIRMED', failed]]);
   });
 
@@ -132,6 +140,7 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
     const resume = Promise.withResolvers();
     let probes = 0;
     const events = [];
+    const timing = [];
     const monitor = monitorDeployment(deploymentId, {
       async observe() {
         assert.ok(++probes <= 3, 'A issued a confirmation probe after losing ownership');
@@ -142,6 +151,7 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
         await resume.promise;
         return routing.withRoutingLock(action);
       },
+      onDecisionTiming: event => timing.push(event),
       recover: () => assert.fail('A attempted rollback after losing ownership'),
       report: event => events.push(event)
     });
@@ -163,6 +173,8 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
     }
 
     assert.equal(await monitor, 'LOST_OWNERSHIP');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(timing.map(event => event.event), ['third_qualifying_failure']);
     assert.equal(probes, 3);
     assert.equal(events[0].status, 'LOST_OWNERSHIP');
     assert.equal(events[0].active_deployment_id, idB);
@@ -170,6 +182,48 @@ describe('runtime monitor', { concurrency: true, timeout: 15000 }, () => {
     assert.equal(routing.readDeployment(idB).manifest.status, 'PROMOTED');
     assert.deepEqual(await Promise.all(paths.map(path => readFile(path))), before);
   });
+
+  test('stamps the third qualifying failure and locked confirmation at their decision points', async t => {
+    const { routing, monitorDeployment, deploymentId } = await fixture(t);
+    const observations = [failed, { ...failed, version: '1.0.0' }, failed, failed, failed, failed];
+    const observationsReturnedAt = [];
+    const timing = [];
+    let lockEnteredAt;
+    let recoveryStartedAt;
+    const status = await monitorDeployment(deploymentId, {
+      observe() {
+        const index = observationsReturnedAt.length;
+        observationsReturnedAt.push(process.hrtime.bigint());
+        return { ...observations[index], observation_id: 'probe-' + (index + 1) };
+      },
+      lockRouting(action) {
+        lockEnteredAt = process.hrtime.bigint();
+        return routing.withRoutingLock(action);
+      },
+      recover() {
+        recoveryStartedAt = process.hrtime.bigint();
+        return confirmOnly();
+      },
+      onDecisionTiming: marker => timing.push(marker),
+      report: () => {}
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(status, 'DEGRADATION_CONFIRMED');
+    assert.deepEqual(timing.map(marker => marker.event), ['third_qualifying_failure', 'locked_degradation_confirmed']);
+    const [third, confirmation] = timing;
+    assert.deepEqual(third.source_observations.map(sample => sample.observation_id), ['probe-3', 'probe-4', 'probe-5']);
+    assert.equal(confirmation.source_observations.at(-1).observation_id, 'probe-6');
+    for (const marker of timing) {
+      assert.equal(marker.deployment_id, deploymentId);
+      assert.equal(marker.clock_source, 'process.hrtime.bigint');
+      assert.match(marker.occurred_monotonic_ns, /^\d+$/);
+    }
+    const thirdAt = BigInt(third.occurred_monotonic_ns);
+    const confirmedAt = BigInt(confirmation.occurred_monotonic_ns);
+    assert.ok(thirdAt >= observationsReturnedAt[4] && thirdAt <= lockEnteredAt);
+    assert.ok(confirmedAt >= observationsReturnedAt[5] && confirmedAt <= recoveryStartedAt);
+  });
+
 });
 
 const stable = { http_status: 200, version: '1.0.0' };

@@ -46,7 +46,8 @@ const OPTIONS = {
   warmup: { type: 'string' },
   'run-id': { type: 'string' },
   out: { type: 'string' },
-  notes: { type: 'string' }
+  notes: { type: 'string' },
+  'notify-start': { type: 'boolean' }
 };
 
 function fail(messages) {
@@ -211,7 +212,8 @@ const config = {
   warmupSeconds: warmup,
   runId,
   runDir,
-  notes: values.notes ?? ''
+  notes: values.notes ?? '',
+  notifyStart: values['notify-start'] === true
 };
 
 const CSV_COLUMNS = [
@@ -373,6 +375,22 @@ function writeRunOutputs(config, observations, metadata) {
   }
 }
 
+// Enable with --notify-start and spawn the driver with a Node IPC channel.
+function notifyStart(runId, clockStart) {
+  const failed = error => console.error('Driver start notification failed: ' + error.message);
+  if (!process.connected || typeof process.send !== 'function') {
+    failed(new Error('No connected IPC channel'));
+    return;
+  }
+  try {
+    process.send({ event: 'driver_start', run_id: runId, clock_alignment: clockStart }, error => {
+      if (error) failed(error);
+    });
+  } catch (error) {
+    failed(error);
+  }
+}
+
 async function scheduleRequests(config, {
   start, observations, pending, stopSignal, forceSignal, onFatal
 }) {
@@ -520,6 +538,13 @@ async function runExperiment(config, stopSignal, forceSignal) {
   const clockStartBeforeNs = process.hrtime.bigint();
   const start = performance.now();
   const clockStartAfterNs = process.hrtime.bigint();
+  const clockStart = () => ({
+    version: 1,
+    source: 'process.hrtime.bigint',
+    start_before_ns: clockStartBeforeNs.toString(),
+    start_after_ns: clockStartAfterNs.toString()
+  });
+  if (config.notifyStart) notifyStart(config.runId, clockStart());
 
   try {
     await scheduleRequests(config, {
@@ -605,10 +630,7 @@ async function runExperiment(config, stopSignal, forceSignal) {
     wall_start_iso: new Date(wallStartMs).toISOString(),
 
     clock_alignment: {
-      version: 1,
-      source: 'process.hrtime.bigint',
-      start_before_ns: clockStartBeforeNs.toString(),
-      start_after_ns: clockStartAfterNs.toString(),
+      ...clockStart(),
       end_before_ns: clockEndBeforeNs.toString(),
       end_after_ns: clockEndAfterNs.toString(),
       elapsed_ns: String(Math.round((clockEndMs - start) * 1e6))

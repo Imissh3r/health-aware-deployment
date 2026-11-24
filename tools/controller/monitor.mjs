@@ -51,7 +51,8 @@ export async function monitorDeployment(deploymentId, {
   lockRouting = withRoutingLock,
   recover = rollbackDeployment,
   operatorDelayMs = null,
-  report
+  report,
+  onDecisionTiming
 }) {
   const candidateVersion = readDeploymentManifest(deploymentId).candidate_version;
   if (typeof candidateVersion !== 'string' || candidateVersion.length === 0) {
@@ -62,6 +63,32 @@ export async function monitorDeployment(deploymentId, {
     observation.http_status === 500 && observation.version === candidateVersion;
   let consecutive = 0;
   let firstFailureProbeAt = null;
+
+  let observationSequence = 0;
+  const streakSamples = [];
+  const sample = observation => ({
+    sequence: ++observationSequence,
+    observation_id: observation.observation_id ?? observation.id ?? null,
+    http_status: observation.http_status,
+    version: observation.version
+  });
+  const markDecision = (event, occurredAt, sourceObservations) => {
+    const marker = {
+      schema_version: 1, event, deployment_id: deploymentId, expected_version: candidateVersion,
+      clock_source: 'process.hrtime.bigint', occurred_monotonic_ns: occurredAt.toString(),
+      source_observations: sourceObservations
+    };
+    // The optional sink runs outside the decision path, with no awaited delivery.
+    setImmediate(async () => {
+      try {
+        await onDecisionTiming(marker);
+      } catch (error) {
+        process.emitWarning('Monitor timing hook failed: ' + String(error));
+      }
+    });
+  };
+  const markConfirmation = (observation, occurredAt) =>
+    markDecision('locked_degradation_confirmed', occurredAt, [...streakSamples, sample(observation)]);
 
   while (true) {
     const manifest = readDeploymentManifest(deploymentId);
@@ -86,8 +113,17 @@ export async function monitorDeployment(deploymentId, {
     const observation = await observe();
     if (qualifies(observation)) {
       consecutive++;
+      if (onDecisionTiming && consecutive <= failureThreshold) {
+        const occurredAt = consecutive === failureThreshold ? process.hrtime.bigint() : null;
+        if (consecutive === 1) streakSamples.length = 0;
+        streakSamples.push(sample(observation));
+        if (occurredAt !== null) markDecision('third_qualifying_failure', occurredAt, [...streakSamples]);
+      } else if (onDecisionTiming) {
+        observationSequence++;
+      }
       if (consecutive === 1) firstFailureProbeAt = new Date().toISOString();
     } else {
+      if (onDecisionTiming) observationSequence++;
       consecutive = 0;
       firstFailureProbeAt = null;
     }
@@ -101,7 +137,11 @@ export async function monitorDeployment(deploymentId, {
           if (conflict) return conflict;
 
           const confirmation = await observe();
-          if (!qualifies(confirmation)) return { status: 'DEGRADATION_CLEARED', confirmation };
+          const confirmed = qualifies(confirmation);
+          const occurredAt = onDecisionTiming && confirmed && operatorDelayMs === null ? process.hrtime.bigint() : null;
+          if (occurredAt !== null) markConfirmation(confirmation, occurredAt);
+          else if (onDecisionTiming) observationSequence++;
+          if (!confirmed) return { status: 'DEGRADATION_CLEARED', confirmation };
           const confirmedAt = new Date().toISOString();
           if (operatorDelayMs !== null) {
             return {
@@ -139,7 +179,10 @@ export async function monitorDeployment(deploymentId, {
             if (conflict) return conflict;
 
             const confirmation = await observe();
-            if (!qualifies(confirmation)) return { status: 'DEGRADATION_CLEARED', confirmation };
+            const confirmed = qualifies(confirmation);
+            const occurredAt = onDecisionTiming && confirmed ? process.hrtime.bigint() : null;
+            if (occurredAt !== null) markConfirmation(confirmation, occurredAt);
+            if (!confirmed) return { status: 'DEGRADATION_CLEARED', confirmation };
             const reconfirmedAt = new Date().toISOString();
             rollbackEntered = true;
             return {
