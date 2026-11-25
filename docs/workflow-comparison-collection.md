@@ -1,0 +1,31 @@
+# Workflow-comparison collection controls
+
+WP4 implements Draft v1.2 coordination for the three approved single-arm runners. Gate E supplies the actual seed, clean collection commit and verified environment. The example seed below is for inspection only.
+
+```sh
+node tools/experiments/formal-collection.mjs plan 01234567
+node tools/experiments/formal-collection.mjs inspect /path/to/collection
+node --test --test-isolation=none tools/experiments/{formal-collection,run-formal-healthy-release,run-formal-faulty-candidate,run-formal-post-rollout-degradation,workflow-client-classifier,formal-trial-classifier}.test.mjs
+```
+
+The CLI is read-only. `plan` emits a draft with null Git and environment fields. `inspect` checks the manifest by regenerating it, replays the ledger, and displays the next eligible arm or the reason collection is blocked. The tests exercise the same collection API with fixture runners, a fixture verifier and separate `fixture-evidence` directories. Fixture ledgers are labeled and cannot dispatch live runners.
+
+## Manifest
+
+Schema version 1 records the protocol revision, algorithm, lowercase hex seed, full Git revision, frozen environment metadata, schedule ID and ordered pairs. Each pair contains the scenario, pair ID, assigned order and its original attempt. Each arm records position, H/C assignment, trial ID and intended Driver V1 run ID. The schedule ID is `wc-` plus SHA-256 of the compact JSON provenance object assembled by the generator.
+
+`sha256-fisher-yates-v1` shuffles four `HC` and four `CH` entries independently for each scenario. For each descending Fisher–Yates index, take the first four bytes of SHA-256 of the UTF-8 text `sha256-fisher-yates-v1:<seed>:<scenario>:<counter>` as a big-endian unsigned integer. The decimal counter starts at zero per scenario and advances for every draw. Reject integers in the incomplete modulo bucket at the top of the 32-bit range, then reduce modulo the number of available positions. The manifest lists S1, S2, S3 in that order, with eight pairs each. Pair IDs append the scenario and pair ordinal to the schedule ID. Attempt IDs append `r01`, `r02` or `r03`, and trial IDs append H or C. Replacements keep their pair's original order.
+
+## Coordinator API
+
+- `generateCollectionManifest({ seed, gitRevision, frozen })` and `initializeCollection(directory, manifest, { mode })` create the plan and publish it into a new directory. Use an existing parent directory and a local filesystem with hard-link and directory-fsync support.
+- `openCollection(directory, { verifyEnvironment })` exposes `inspect()`, `runNext()`, `reconcile(details)` and `decidePair(details)`. Each `runNext()` attempts at most one arm. The formal API dispatches the approved scenario runner. Fixture mode requires an explicit injected runner map and never falls back to live runners.
+- The formal admission check requires the expected branch, exact Git revision, clean checkout, frozen hostname, explicit `COMPOSE_PROJECT_NAME` and `DEPLOYMENT_PROXY_URL`, and a verifier supplied by the collection operator. The verifier receives a copy of the expected metadata and must independently observe and return `{ gitRevision, frozen }` for comparison on every launch. Frozen metadata contains the host, Compose project, canonical loopback proxy URL, stable config SHA-256, environment fingerprint, sanitized effective Compose config digest and reference, immutable image digests by service and preflight reference. The verifier should report only sanitized failure reasons. Each runner also runs its own preflight.
+- The manifest and numbered ledger events are create-once. The coordinator publishes each ledger event via a flushed temporary file and an exclusive hard link. A durable start precedes runner invocation and records the assigned and attempted arm, evidence path and process owner. The outcome event preserves the full returned summary after checking it against the runner's evidence file. Each event includes a manifest hash, sequence, timestamp and mode. Runner artifacts remain in their own create-once directories.
+
+## Continuation and adjudication
+
+- An arm can start only at the next manifest position. The coordinator requires the runner's `nextArmAllowed`, compatible cleanup status and a verified reset with evidence before continuing. A preflight mismatch or unsafe reset blocks further launches. A recorded start without an outcome also blocks launches, including after a restart.
+- `reconcile` requires `authorizedBy`, `reason`, `evidenceRef`, `operationsSettled: true` and `resetVerified: true`. The operator must positively verify settlement and stable reset and reference that evidence. A still-active starting coordinator cannot be reconciled. An interrupted arm with a usable summary can recover that summary in place. A missing or unusable summary requires `aborted: true`, which preserves partial evidence and leaves validity undecided. The same trial ID is never launched again after a start. A reconciled preflight failure can retry admission because the arm was never started.
+- A technically valid round advances after both arms, regardless of workflow outcome. An invalid, uncertain or aborted result leaves the pair pending review after both slots are resolved. `decidePair` records `retain` or `replace` with an authorizer, reason and evidence reference. Replacement also requires the affected `invalidTrialId`, `matchingInvalid: true` and a `technicalReason`. An uncertain or aborted result needs an explicit `adjudicatedValidity: 'invalid'` finding supported by the review evidence. The decision links both preceding trial IDs. After `r03`, retain the available evidence and record the remaining shortfall in the disposition.
+- Gate E must designate the authorized coordinator, collection directory, reviewers and source of reset evidence for the frozen environment. Use one collection directory per authorized schedule on that environment. The ledger enforces exclusion within that directory. Gate E must also supply the independent live environment verifier and freeze the host, effective Compose configuration and bindings, immutable image identities, source revision, protocol, preflight report and final seed. Final evidence packaging and metric selection belong to WP5.
