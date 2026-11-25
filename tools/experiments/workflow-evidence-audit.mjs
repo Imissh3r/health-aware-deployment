@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual as equal } from 'node:util';
-import { openCollection, validateCollectionManifest } from './formal-collection.mjs';
+import { collectionEvidenceDirectory, openCollection, validateCollectionPlan } from './formal-collection.mjs';
 import { controllerResult, readWorkload } from './run-formal-healthy-release.mjs';
 import { classifyWorkflowClient } from './workflow-client-classifier.mjs';
 
@@ -61,7 +61,7 @@ function jsonl(text) {
 }
 
 function inventory(manifest, events) {
-  const pairs = manifest.pairs.map(pair => ({
+  const pairs = (manifest.pairs ?? []).map(pair => ({
     scenario: pair.scenario, pairId: pair.pairId, plannedOrder: pair.plannedOrder,
     attempts: [{ ...pair.original, disposition: 'current' }]
   }));
@@ -72,6 +72,8 @@ function inventory(manifest, events) {
     for (const arm of attempt.arms) arms.set(arm.trialId, arm);
   }
   for (const pair of pairs) add(pair.attempts[0]);
+  const rehearsal = manifest.purpose === 'rehearsal' ? { arms: manifest.arms } : null;
+  if (rehearsal) add(rehearsal);
   for (const event of events) {
     if (event.type === 'pair_decision') {
       const pair = attempts.get(event.attemptId);
@@ -111,7 +113,7 @@ function inventory(manifest, events) {
     }
     if (event.type === 'reconcile') arm.reconciled = true;
   }
-  return pairs;
+  return { pairs, rehearsalArms: rehearsal?.arms ?? [] };
 }
 
 function verifyEventSources(index, issue) {
@@ -342,14 +344,13 @@ export function auditWorkflowCollection(directory) {
   const parsed = artifact(root, 'manifest.json', artifacts, JSON.parse);
   let wrapper;
   let ledger;
-  let pairs = [];
+  let inventoryResult = { pairs: [], rehearsalArms: [] };
   const trialEvidence = new Map();
   if (parsed) {
     try {
-      validateCollectionManifest(parsed.manifest);
-      if (!['formal', 'fixture'].includes(parsed.mode)) throw new Error('collection_mode');
+      validateCollectionPlan(parsed.mode, parsed.manifest);
       wrapper = parsed;
-      pairs = inventory(wrapper.manifest, []);
+      inventoryResult = inventory(wrapper.manifest, []);
     } catch {
       issues.push({ status: 'inconsistent', code: 'manifest_validation_failed' });
     }
@@ -367,9 +368,10 @@ export function auditWorkflowCollection(directory) {
       if (replay.manifestHash !== hash(JSON.stringify({ mode: wrapper.mode, manifest: wrapper.manifest })) ||
           !equal(recorded, replay.events)) throw new Error('collection_changed_during_audit');
       ledger = replay;
-      pairs = inventory(wrapper.manifest, ledger.events);
-      const evidenceRoot = wrapper.mode === 'fixture' ? 'fixture-evidence' : 'trial-evidence';
-      const trials = pairs.flatMap(pair => pair.attempts.flatMap(attempt => attempt.arms));
+      inventoryResult = inventory(wrapper.manifest, ledger.events);
+      const evidenceRoot = collectionEvidenceDirectory(wrapper.mode);
+      const trials = [...inventoryResult.rehearsalArms,
+        ...inventoryResult.pairs.flatMap(pair => pair.attempts.flatMap(attempt => attempt.arms))];
       if (entry(root, evidenceRoot)?.isDirectory()) {
         const started = new Set(trials.filter(trial => trial.start).map(trial => trial.trialId));
         for (const trialId of readdirSync(join(root, evidenceRoot))) {
@@ -398,5 +400,5 @@ export function auditWorkflowCollection(directory) {
     }
   }
   issues.push({ status: 'unverifiable', code: 'no_collection_bound_source_or_full_artifact_digest_index' });
-  return { root, wrapper, ledger, artifacts, issues, pairs, trialEvidence };
+  return { root, wrapper, ledger, artifacts, issues, ...inventoryResult, trialEvidence };
 }

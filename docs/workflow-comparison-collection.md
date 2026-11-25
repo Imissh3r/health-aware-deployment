@@ -29,3 +29,26 @@ Schema version 1 records the protocol revision, algorithm, lowercase hex seed, f
 - `reconcile` requires `authorizedBy`, `reason`, `evidenceRef`, `operationsSettled: true` and `resetVerified: true`. The operator must positively verify settlement and stable reset and reference that evidence. A still-active starting coordinator cannot be reconciled. An interrupted arm with a usable summary can recover that summary in place. A missing or unusable summary requires `aborted: true`, which preserves partial evidence and leaves validity undecided. The same trial ID is never launched again after a start. A reconciled preflight failure can retry admission because the arm was never started.
 - A technically valid round advances after both arms, regardless of workflow outcome. An invalid, uncertain or aborted result leaves the pair pending review after both slots are resolved. `decidePair` records `retain` or `replace` with an authorizer, reason and evidence reference. Replacement also requires the affected `invalidTrialId`, `matchingInvalid: true` and a `technicalReason`. An uncertain or aborted result needs an explicit `adjudicatedValidity: 'invalid'` finding supported by the review evidence. The decision links both preceding trial IDs. After `r03`, retain the available evidence and record the remaining shortfall in the disposition.
 - Gate E must designate the authorized coordinator, collection directory, reviewers and source of reset evidence for the frozen environment. Use one collection directory per authorized schedule on that environment. The ledger enforces exclusion within that directory. Gate E must also supply the independent live environment verifier and freeze the host, effective Compose configuration and bindings, immutable image identities, source revision, protocol, preflight report and final seed. Final evidence packaging and metric selection belong to WP5.
+
+## Comparison stack for an authorized rehearsal
+
+The persistent `compose.comparison.yaml` override replaces the two published-port lists. Select it explicitly with the base file. It requires Compose 2.24.4 or newer for the `!override` tag. The override selects the historical comparison project, Nginx loopback port 18080 and stable app loopback port 13000. The base defines the internal candidate and database, database volume and read-only Nginx runtime mount.
+
+Run the following only after live startup is separately authorized. Keep these exports in the shell that will invoke the rehearsal API so the runner and its controller subprocesses select the same files.
+
+```sh
+cd /home/sree_odin/projects/health-aware-workflow-comparison
+unset COMPOSE_PATH_SEPARATOR
+export COMPOSE_PROJECT_NAME=health-aware-workflow-comparison
+export COMPOSE_FILE="$(pwd -P)/compose.yaml:$(pwd -P)/compose.comparison.yaml"
+export DEPLOYMENT_PROXY_URL=http://127.0.0.1:18080/api/work
+docker compose --profile routing up -d --no-build --no-recreate --pull never
+```
+
+Before startup, verify the existing comparison containers' image IDs, mount and volume, and verify that both intended host ports are free. The startup command preserves existing containers and their volume. Gate D must still verify the running ports, service health, fault flag and stable route. Compose obtains credentials from its usual local environment or ignored `.env` file.
+
+## Real rehearsal provenance
+
+Use `generateRehearsalManifest({ sessionId, gitRevision, frozen, arms })` with a unique session ID and an ordered array of selected `{ scenario, arm }` values. Initialize a new collection directory with `initializeCollection(directory, manifest, { mode: 'rehearsal' })`. Store it separately from formal and archived evidence. Operate only one active collection or rehearsal against the comparison stack at a time. There is no seed, pair, or replacement round in a rehearsal plan. Trial IDs begin with `rehearsal-` and evidence lives under `rehearsal-evidence/`.
+
+Read the plan and ledger with the existing offline `inspect` command. For an authorized live call use `openCollection(directory, { expectedMode: 'rehearsal', verifyEnvironment })` and call `runNext()` once per selected arm. The explicit mode is also required for `reconcile()`. Rehearsal execution applies the existing clean-checkout, Git, host, environment, and reset checks and requires the comparison Compose file list above. The operator's verifier must independently check the rehearsal environment. Reuse the same directory and manifest on resume. An unsafe outcome or unresolved start blocks continuation until explicitly reconciled. Started IDs are never reused. To rehearse another arm after finishing the plan, authorize a new session with a new ID.

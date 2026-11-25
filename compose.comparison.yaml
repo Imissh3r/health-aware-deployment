@@ -1,0 +1,9 @@
+name: health-aware-workflow-comparison
+
+services:
+  app:
+    ports: !override
+      - "127.0.0.1:13000:3000"
+  nginx:
+    ports: !override
+      - "127.0.0.1:18080:80"

@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { generateCollectionManifest, initializeCollection, openCollection } from './formal-collection.mjs';
+import { generateCollectionManifest, generateRehearsalManifest, initializeCollection, openCollection } from './formal-collection.mjs';
 import { readWorkload } from './run-formal-healthy-release.mjs';
 import { classifyWorkflowClient } from './workflow-client-classifier.mjs';
 import { analyzeWorkflowCollection, writeWorkflowReports } from './analyze-workflow-collection.mjs';
@@ -44,7 +44,7 @@ function fixture(t, behavior = () => ({})) {
   return { root, parent, manifest, collection, run, report: () => analyzeWorkflowCollection(root) };
 }
 
-function syntheticTrial(scenario, { arm, trialId, evidenceRoot }, config) {
+function syntheticTrial(scenario, { arm, trialId, evidenceRoot, frozen: trialEnvironment = frozen }, config) {
   const runId = trialId + '-driver';
   const directory = join(evidenceRoot, trialId);
   mkdirSync(directory);
@@ -61,7 +61,7 @@ function syntheticTrial(scenario, { arm, trialId, evidenceRoot }, config) {
     start_after_ns: String(base + clockWidth), end_before_ns: String(base + 120n * S - clockWidth),
     end_after_ns: String(base + 120n * S + clockWidth),
     elapsed_ns: String(120n * S) };
-  at('trial_started', -1, { arm, scenario, runId, trialId, frozen });
+  at('trial_started', -1, { arm, scenario, runId, trialId, frozen: trialEnvironment });
   at('preflight_passed', -1);
   at('driver_start_notification_received', 0.01, { payload: { event: 'driver_start', run_id: runId, clock_alignment: clock } });
   const probes = scenario === 'S2' ? ['/api/work', '/health', '/ready'].map((path, i) =>
@@ -109,7 +109,7 @@ function syntheticTrial(scenario, { arm, trialId, evidenceRoot }, config) {
   writeFileSync(join(directory, 'events.jsonl'), events.map(event => JSON.stringify(event)).join('\n') + '\n');
   const raw = join(directory, runId);
   mkdirSync(raw);
-  write(join(raw, 'run.json'), { run_id: runId, status: 'complete', target_url: frozen.proxyUrl, clock_alignment: clock,
+  write(join(raw, 'run.json'), { run_id: runId, status: 'complete', target_url: trialEnvironment.proxyUrl, clock_alignment: clock,
     git: { commit: gitRevision, working_tree: 'clean' },
     options: { rate: 5, duration_seconds: 120, warmup_seconds: 5, timeout_ms: 3000, max_concurrency: 50, max_lateness_ms: 200 } });
   const rows = Array.from({ length: 600 }, (_, index) => {
@@ -126,7 +126,7 @@ function syntheticTrial(scenario, { arm, trialId, evidenceRoot }, config) {
   const workload = readWorkload(directory, runId);
   const inputs = { scenario, arm, origin: origin ?? null, ...(scenario === 'S3' && { deployment, faultWriteStarted: writeStart }),
     restore, intervention: null, exposureConfirmed: exposed, recoveryApplicable: exposed,
-    prevention: { rejected, stableContinuity }, expectedTargetUrl: frozen.proxyUrl };
+    prevention: { rejected, stableContinuity }, expectedTargetUrl: trialEnvironment.proxyUrl };
   const result = classifyWorkflowClient({ ...inputs, run: workload.run.value, requests: workload.requests.value });
   const files = Object.fromEntries(Object.entries(workload).map(([key, { value, ...fields }]) => [key, fields]));
   write(join(directory, 'classifier.json'), { inputs, result, files });
@@ -313,4 +313,86 @@ test('clock-bounded overhead stays bounded when client cohort membership is ambi
   assert.equal(measures.deployment_overhead.boundedPairs, 1);
   const bounds = measures.deployment_overhead.examples[0].differenceBoundsNs;
   assert.ok(bounds[0] < 1e9 && bounds[1] > 1e9);
+});
+
+test('selected rehearsal arms retain provenance, safety holds and raw evidence without paired analysis', async t => {
+  const parent = mkdtempSync(join(tmpdir(), 'wp5-rehearsal-schema-fixture-'));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const root = join(parent, 'rehearsal');
+  const environment = { ...frozen, project: 'health-aware-workflow-comparison' };
+  const manifest = generateRehearsalManifest({ sessionId: 'offline-schema-test', gitRevision, frozen: environment,
+    arms: [{ scenario: 'S2', arm: 'C' }, { scenario: 'S3', arm: 'H' }, { scenario: 'S1', arm: 'H' }] });
+  initializeCollection(root, manifest, { mode: 'rehearsal' });
+  const evidenceRoot = join(root, 'rehearsal-evidence');
+  mkdirSync(evidenceRoot);
+  writeFileSync(join(root, 'compose.txt'), 'sanitized fixture compose');
+  write(join(root, 'preflight.json'), { syntheticSchemaTest: true });
+  const readOnly = openCollection(root);
+  const collection = openCollection(root, { expectedMode: 'rehearsal' });
+  assert.throws(() => openCollection(root, { expectedMode: 'formal' }), /expected mode/);
+  assert.throws(() => initializeCollection(join(parent, 'formal'), manifest), /seed/);
+  assert.throws(() => openCollection(root, { fixtureRunners: {} }), /Invalid collection mode/);
+  assert.throws(() => initializeCollection(root, manifest, { mode: 'rehearsal' }), /EEXIST/);
+  await assert.rejects(readOnly.runNext(), /Explicit rehearsal/);
+  const formal = generateCollectionManifest({ seed: '01', gitRevision, frozen: environment });
+  const formalRoot = join(parent, 'formal');
+  initializeCollection(formalRoot, formal);
+  assert.throws(() => openCollection(formalRoot, { expectedMode: 'rehearsal' }), /expected mode/);
+  assert.throws(() => initializeCollection(join(parent, 'bad-plan'), { ...manifest,
+    arms: [manifest.arms[0], manifest.arms[0]] }, { mode: 'rehearsal' }), /Invalid rehearsal manifest/);
+  const formalIds = new Set(formal.pairs.flatMap(pair => pair.original.arms.map(arm => arm.trialId)));
+  assert.ok(manifest.arms.every(trial => !formalIds.has(trial.trialId)));
+  const [first, second, third] = manifest.arms;
+  const pathFor = trial => join(evidenceRoot, trial.trialId);
+  mkdirSync(pathFor(first));
+  await assert.rejects(collection.runNext(), /already exists/);
+  rmSync(pathFor(first), { recursive: true });
+
+  // Replay records built by the offline fixture; never call the production runner.
+  const event = (sequence, payload) => writeFileSync(join(root, 'ledger', String(sequence).padStart(6, '0') + '.json'),
+    JSON.stringify({ sequence, mode: 'rehearsal', manifestHash: readOnly.inspect().manifestHash,
+      recordedAt: '2026-11-25T00:00:00.000Z', ...payload }), { flag: 'wx' });
+  const start = (sequence, trial) => event(sequence, { type: 'start', trial, evidencePath: pathFor(trial),
+    host: hostname(), pid: process.pid });
+  start(1, first);
+  await assert.rejects(collection.runNext(), /interrupted_or_unresolved/);
+  const outcome = syntheticTrial(first.scenario, { ...first, evidenceRoot, frozen: environment }, { failure: true });
+  outcome.cleanup = { status: 'failed' };
+  outcome.reset = { status: 'failed' };
+  outcome.nextArmAllowed = false;
+  const outcomeRef = join(pathFor(first), 'summary.json');
+  write(outcomeRef, outcome);
+  event(2, { type: 'outcome', trialId: first.trialId, startedAt: 1, outcomeRef, outcome });
+  await assert.rejects(collection.runNext(), /reset_blocked/);
+  assert.throws(() => collection.reconcile({ ...review, operationsSettled: true }), /verified reset/);
+  collection.reconcile({ ...review, operationsSettled: true, resetVerified: true });
+  assert.equal(collection.inspect().trial.trialId, second.trialId);
+  start(4, second);
+  collection.reconcile({ ...review, operationsSettled: true, resetVerified: true, aborted: true });
+  assert.equal(collection.inspect().trial.trialId, third.trialId);
+  assert.throws(() => collection.decidePair({ decision: 'replace' }), /not eligible/);
+  const before = snap(root);
+  const report = analyzeWorkflowCollection(root);
+  assert.equal(report.provenance.mode, 'rehearsal');
+  assert.deepEqual(report.pairs, []);
+  assert.deepEqual(report.scenarios, []);
+  assert.deepEqual(report.rehearsalArms.map(arm => arm.status), ['completed', 'aborted', 'planned']);
+  assert.ok(report.rehearsalArms.every(arm => arm.provenance === 'rehearsal' && !arm.accepted));
+  assert.equal(report.rehearsalArms[0].safety.nextArmAllowed, false);
+  assert.equal(report.rehearsalArms[0].recordedOutcome, 'FAILED');
+  assert.equal(report.audit.trials[0].clockVerified, true);
+  const target = join(parent, 'report');
+  writeWorkflowReports(report, target, { analysisGitRevision: gitRevision, analysisTimestamp: '2026-11-25T00:00:00.000Z' });
+  assert.match(readFileSync(join(target, 'summary.md'), 'utf8'), /rehearsal — nonformal evidence/);
+  assert.equal(read(join(target, 'rehearsal-arms.json')).mode, 'rehearsal');
+  assert.ok(!readdirSync(target).includes('matched-pairs.json'));
+  assert.deepEqual(snap(root), before);
+
+  start(6, third);
+  collection.reconcile({ ...review, operationsSettled: true, resetVerified: true, aborted: true });
+  assert.equal(collection.inspect().status, 'collection_complete');
+  await assert.rejects(collection.runNext(), /collection_complete/);
+
+  write(join(root, 'manifest.json'), { mode: 'formal', manifest });
+  assert.throws(() => openCollection(root), /seed/);
 });

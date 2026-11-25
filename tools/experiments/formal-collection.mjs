@@ -98,6 +98,35 @@ export function validateCollectionManifest(manifest) {
     'Manifest conflicts with the deterministic schedule or contains invalid identifiers');
 }
 
+export function generateRehearsalManifest({ sessionId, gitRevision, frozen, arms }) {
+  requireCondition(matches(/^[a-z0-9][a-z0-9-]{0,63}$/, sessionId), 'Provide a unique rehearsal session ID');
+  requireCondition(matches(gitHash, gitRevision), 'Expected a full Git revision');
+  const environment = frozenMetadata(frozen);
+  requireCondition(environment.project === 'health-aware-workflow-comparison' &&
+    environment.proxyUrl === 'http://127.0.0.1:18080/api/work', 'Rehearsal requires the comparison project and proxy');
+  requireCondition(Array.isArray(arms) && arms.length > 0, 'Select at least one rehearsal arm');
+  return { schemaVersion: 1, protocolRevision: 'Draft v1.2', purpose: 'rehearsal', sessionId, gitRevision,
+    frozen: environment, arms: arms.map(({ scenario, arm }, index) => {
+      requireCondition(Object.hasOwn(runners, scenario) && ['H', 'C'].includes(arm), 'Invalid rehearsal arm');
+      const position = index + 1;
+      const trialId = `rehearsal-${sessionId}-${position}-${scenario}-${arm}`;
+      return { scenario, arm, position, trialId, driverRunId: trialId + '-driver' };
+    }) };
+}
+
+export function validateCollectionPlan(mode, manifest) {
+  if (mode === 'rehearsal') {
+    requireCondition(isDeepStrictEqual(manifest, generateRehearsalManifest(manifest)), 'Invalid rehearsal manifest or trial IDs');
+  } else {
+    requireCondition(['formal', 'fixture'].includes(mode), 'Unknown collection mode');
+    validateCollectionManifest(manifest);
+  }
+}
+
+export function collectionEvidenceDirectory(mode) {
+  return { formal: 'trial-evidence', fixture: 'fixture-evidence', rehearsal: 'rehearsal-evidence' }[mode];
+}
+
 function sync(path) {
   const fd = openSync(path, 'r');
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -123,8 +152,7 @@ function publish(path, value) {
 }
 
 export function initializeCollection(directory, manifest, { mode = 'formal' } = {}) {
-  validateCollectionManifest(manifest);
-  requireCondition(['formal', 'fixture'].includes(mode), 'Unknown collection mode');
+  validateCollectionPlan(mode, manifest);
   mkdirSync(directory, { mode: 0o700 });
   sync(dirname(resolve(directory)));
   mkdirSync(join(directory, 'ledger'), { mode: 0o700 });
@@ -164,6 +192,7 @@ function inspectState(state) {
   if (state.block) return { status: state.block.status, trial: state.block.trial, reason: state.block.reason };
   if (!state.round) return { status: 'collection_complete' };
   if (trial) return { status: 'planned', trial };
+  if (state.rehearsal) return { status: 'collection_complete' };
   if (state.results.every(result => result.outcome?.validity.status === 'valid')) return { status: 'pair_complete' };
   return { status: 'pair_review_required', attemptId: state.round.attemptId };
 }
@@ -258,16 +287,19 @@ function transition(state, event, manifest, evidenceRoot) {
   if (inspectState(state).status === 'pair_complete') advance(state, manifest);
 }
 
-export function openCollection(directory, { verifyEnvironment, fixtureRunners, now = () => new Date() } = {}) {
+export function openCollection(directory, { expectedMode, verifyEnvironment, fixtureRunners, now = () => new Date() } = {}) {
   const root = realpathSync(directory);
   const { mode, manifest } = read(join(root, 'manifest.json'));
-  validateCollectionManifest(manifest);
-  requireCondition(['formal', 'fixture'].includes(mode) && (!fixtureRunners || mode === 'fixture'), 'Invalid collection mode');
+  validateCollectionPlan(mode, manifest);
+  requireCondition(expectedMode === undefined || expectedMode === mode, 'Collection mode differs from the expected mode');
+  requireCondition(!fixtureRunners || mode === 'fixture', 'Invalid collection mode');
   const manifestHash = sha256(json({ mode, manifest }));
   const ledger = join(root, 'ledger');
-  const evidenceRoot = join(root, mode === 'fixture' ? 'fixture-evidence' : 'trial-evidence');
+  const rehearsal = mode === 'rehearsal';
+  const evidenceRoot = join(root, collectionEvidenceDirectory(mode));
   const load = () => {
-    const state = { pairIndex: 0, round: manifest.pairs[0].original, results: [], block: null };
+    const state = { pairIndex: 0, rehearsal, round: rehearsal ? { arms: manifest.arms } : manifest.pairs[0].original,
+      results: [], block: null };
     const files = readdirSync(ledger).filter(file => !file.startsWith('.pending-')).sort();
     const events = files.map((file, index) => {
       requireCondition(file === eventFile(index + 1), 'Missing, duplicate or unexpected collection ledger record');
@@ -300,6 +332,7 @@ export function openCollection(directory, { verifyEnvironment, fixtureRunners, n
     },
 
     async runNext() {
+      requireCondition(!rehearsal || expectedMode === 'rehearsal', 'Explicit rehearsal execution mode is required');
       const snapshot = load();
       const next = inspectState(snapshot.state);
       requireCondition(next.status === 'planned', 'No eligible arm: ' + next.status);
@@ -311,7 +344,7 @@ export function openCollection(directory, { verifyEnvironment, fixtureRunners, n
         'Execution requires a scenario runner and an explicit environment verifier');
       try {
         requireCondition(manifest.gitRevision && manifest.frozen, 'Frozen Git and environment metadata are required');
-        if (mode === 'formal') {
+        if (mode !== 'fixture') {
           const git = async (...args) => {
             const result = await execute('git', ['-C', repo, ...args], { encoding: 'utf8' });
             return result.stdout.trim();
@@ -322,6 +355,11 @@ export function openCollection(directory, { verifyEnvironment, fixtureRunners, n
           requireCondition(hostname() === manifest.frozen.host &&
             process.env.COMPOSE_PROJECT_NAME === manifest.frozen.project &&
             process.env.DEPLOYMENT_PROXY_URL === manifest.frozen.proxyUrl, 'Frozen process environment mismatch');
+          if (rehearsal) {
+            const expectedFiles = ['compose.yaml', 'compose.comparison.yaml'].map(file => resolve(repo, file)).join(':');
+            requireCondition(process.env.COMPOSE_FILE === expectedFiles && !process.env.COMPOSE_PATH_SEPARATOR,
+              'Rehearsal requires the explicit comparison Compose file list');
+          }
         }
         const verified = await verifyEnvironment(copy({ gitRevision: manifest.gitRevision, frozen: manifest.frozen }));
         requireCondition(verified?.gitRevision === manifest.gitRevision &&
@@ -361,6 +399,7 @@ export function openCollection(directory, { verifyEnvironment, fixtureRunners, n
     },
 
     reconcile({ authorizedBy, reason, evidenceRef, resetVerified, operationsSettled, aborted }) {
+      requireCondition(!rehearsal || expectedMode === 'rehearsal', 'Explicit rehearsal execution mode is required');
       const snapshot = load();
       const block = snapshot.state.block;
       requireCondition(block, 'No safety block to reconcile');

@@ -40,3 +40,7 @@ The API accepts an explicit analysis Git revision and ISO timestamp for reproduc
 ## Remaining collection gates
 
 Gate D must rehearse audit ingestion on actual runner output and confirm prospective clock evidence, intervention logging, environment snapshot capture and finalization across cleanup and recovery branches. Gate E must bind sanitized environment snapshots and executable and artifact digests to the authorized manifest or a separately approved provenance record, settle how an archived collection preserves or maps WP4's absolute paths, and define structured metric-scoped adjudication for cases outside the implemented review rules. An unverifiable provenance report cannot serve as a freeze certification.
+
+## Rehearsal reports
+
+WP5 accepts the dedicated WP4 `rehearsal` manifest and ledger. The `audit`, `inspect`, and `report` commands work with that directory at its recorded location. Rehearsal reports identify the nonformal session in the heading and provenance, and use `rehearsal-arms.json` for the individual inventory, metrics, outcomes, and safety state. They omit formal pair artifacts. Rehearsal trials are excluded from formal paired analysis even when the selected arms happen to include both workflows.

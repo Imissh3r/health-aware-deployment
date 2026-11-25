@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { collectionEvidenceDirectory } from './formal-collection.mjs';
 import { auditWorkflowCollection, inside } from './workflow-evidence-audit.mjs';
 
 const version = '1.0.0';
@@ -298,6 +299,24 @@ export function analyzeWorkflowCollection(directory) {
   const input = auditWorkflowCollection(directory);
   const { manifest, mode } = input.wrapper ?? {};
   const blocked = !input.ledger || input.issues.some(bad) || input.artifacts.some(bad);
+  const describeTrial = ({ start, terminal, ...trial }, accepted) => {
+    const evidence = input.trialEvidence.get(trial.trialId);
+    const trusted = evidence?.summary && evidence.result && evidence.clockVerified &&
+      !evidence.earlyCleanup && !evidence.issues.some(bad) && !evidence.artifacts.some(bad);
+    return { ...trial, started: Boolean(start), validity: terminal?.outcome.validity
+      ? { status: terminal.outcome.validity.status, issues: terminal.outcome.validity.issues.filter(issue =>
+        typeof issue === 'string' && /^[a-z_]+$/.test(issue)) } : null,
+    evidenceRef: start ? join(collectionEvidenceDirectory(mode), trial.trialId) : null,
+    accepted,
+    ...(mode === 'rehearsal' && { provenance: 'rehearsal', safety: terminal ? {
+      nextArmAllowed: terminal.outcome.nextArmAllowed,
+      cleanup: terminal.outcome.cleanup?.status ?? null, reset: terminal.outcome.reset?.status ?? null
+    } : null }),
+    metrics: metricsFor({ ...trial, terminal }, evidence),
+    recordedOutcome: typeof terminal?.outcome.workflow?.deployment === 'string' &&
+      /^[A-Z_]+$/.test(terminal.outcome.workflow.deployment) ? terminal.outcome.workflow.deployment : null,
+    supporting: trusted ? supporting(evidence) : null };
+  };
   const pairs = input.pairs.map(pair => {
     const latest = pair.attempts.at(-1);
     const reviewed = latest.disposition === 'retained_for_review';
@@ -310,25 +329,13 @@ export function analyzeWorkflowCollection(directory) {
             : 'evidence_or_validity_unresolved';
     return { ...pair, acceptedAttemptId, selectionReason, attempts: pair.attempts.map(attempt => ({
       ...attempt,
-      arms: attempt.arms.map(({ start, terminal, ...trial }) => {
-        const evidence = input.trialEvidence.get(trial.trialId);
-        const trusted = evidence?.summary && evidence.result && evidence.clockVerified &&
-          !evidence.earlyCleanup && !evidence.issues.some(bad) && !evidence.artifacts.some(bad);
-        return { ...trial, started: Boolean(start), validity: terminal?.outcome.validity
-          ? { status: terminal.outcome.validity.status, issues: terminal.outcome.validity.issues.filter(issue =>
-            typeof issue === 'string' && /^[a-z_]+$/.test(issue)) } : null,
-        evidenceRef: start ? join(mode === 'fixture' ? 'fixture-evidence' : 'trial-evidence', trial.trialId) : null,
-        accepted: attempt.attemptId === acceptedAttemptId,
-        metrics: metricsFor({ ...trial, terminal }, evidence),
-        recordedOutcome: typeof terminal?.outcome.workflow?.deployment === 'string' &&
-          /^[A-Z_]+$/.test(terminal.outcome.workflow.deployment) ? terminal.outcome.workflow.deployment : null,
-        supporting: trusted ? supporting(evidence) : null };
-      })
+      arms: attempt.arms.map(trial => describeTrial(trial, attempt.attemptId === acceptedAttemptId))
     })) };
   });
   const audit = {
     status: blocked ? 'blocked' : [...input.trialEvidence.values()].some(evidence =>
       evidence.issues.some(bad) || evidence.artifacts.some(bad)) ? 'trial_integrity_issues' : 'provenance_unverifiable',
+    ...(mode === 'rehearsal' && { mode, sessionId: manifest.sessionId }),
     collectionArtifacts: input.artifacts, issues: input.issues,
     trials: [...input.trialEvidence].map(([trialId, evidence]) =>
       ({ trialId, artifacts: evidence.artifacts, issues: evidence.issues, clockVerified: evidence.clockVerified ?? false })),
@@ -346,22 +353,34 @@ export function analyzeWorkflowCollection(directory) {
   const provenance = {
     analysisSourceSha256,
     schemaVersion: 1, toolVersion: version, protocolRevision: manifest?.protocolRevision ?? null,
-    mode: mode === 'fixture' ? 'synthetic_fixture' : mode === 'formal' ? 'formal_collection_input' : 'unverified_input',
+    mode: mode === 'rehearsal' ? 'rehearsal' : mode === 'fixture' ? 'synthetic_fixture' : mode === 'formal' ? 'formal_collection_input' : 'unverified_input',
+    ...(mode === 'rehearsal' && { sessionId: manifest.sessionId }),
     scheduleId: manifest?.scheduleId ?? null, manifestHash: input.ledger?.manifestHash ?? null,
     collectionGitRevision: manifest?.gitRevision ?? null, seed: manifest?.seed ?? null,
     algorithm: manifest?.algorithm ?? null,
     environment: manifest?.frozen ? { fingerprint: manifest.frozen.environmentFingerprint,
       composeConfigSha256: manifest.frozen.composeConfigSha256, stableConfigSha256: manifest.frozen.stableConfigSha256,
       imageDigests: manifest.frozen.imageDigests } : null,
-    selectionRule: 'Current WP4 round only. Original and superseded evidence remains in the inventory. Unresolved review excludes the pair.',
-    pairedDifference: 'C minus H', quantileMethod: 'Linear interpolation at (n - 1) * p',
+    selectionRule: mode === 'rehearsal' ? 'Individual rehearsal arms only. Excluded from formal paired analysis.' : 'Current WP4 round only. Original and superseded evidence remains in the inventory. Unresolved review excludes the pair.',
+    pairedDifference: mode === 'rehearsal' ? null : 'C minus H',
+    quantileMethod: mode === 'rehearsal' ? null : 'Linear interpolation at (n - 1) * p',
     provenanceStatus: audit.status, limitations
   };
-  return { root: input.root, provenance, audit, pairs, scenarios: ['S1', 'S2', 'S3'].map(scenario => aggregate(pairs, scenario)) };
+  return { root: input.root, provenance, audit, pairs,
+    ...(mode === 'rehearsal' && { rehearsalArms: input.rehearsalArms.map(trial => describeTrial(trial, false)) }),
+    scenarios: mode === 'rehearsal' ? [] : ['S1', 'S2', 'S3'].map(scenario => aggregate(pairs, scenario)) };
 }
 
 function markdown(report) {
   const { provenance, audit, scenarios } = report;
+  if (provenance.mode === 'rehearsal') {
+    return ['# Workflow comparison rehearsal — nonformal evidence', '',
+      'Session — ' + provenance.sessionId, 'Integrity state — ' + audit.status,
+      'Collection state — ' + audit.collectionState, '', 'Individual rehearsals are excluded from formal paired analysis.', '',
+      '| Trial | Scenario | Arm | Status | Outcome | Cleanup | Reset |',
+      '| --- | --- | --- | --- | --- | --- | --- |',
+      ...report.rehearsalArms.map(arm => `| ${arm.trialId} | ${arm.scenario} | ${arm.arm} | ${arm.status} | ${arm.recordedOutcome ?? '—'} | ${arm.safety?.cleanup ?? '—'} | ${arm.safety?.reset ?? '—'} |`), ''].join('\n');
+  }
   const lines = ['# Workflow comparison evidence report', '',
     provenance.mode === 'synthetic_fixture' ? '**Synthetic fixture. These values are test results.**'
       : '**Offline descriptive report. Full collection provenance remains unverified.**', '',
@@ -401,7 +420,10 @@ export function writeWorkflowReports(report, directory, { analysisGitRevision, a
   mkdirSync(target, { mode: 0o700 });
   const write = (name, content) => writeFileSync(join(target, name), content, { flag: 'wx', mode: 0o600 });
   const artifacts = {
-    'integrity.json': report.audit, 'inventory.json': report.pairs, 'matched-pairs.json': report.scenarios,
+    'integrity.json': report.audit,
+    ...(report.provenance.mode === 'rehearsal'
+      ? { 'rehearsal-arms.json': { mode: 'rehearsal', arms: report.rehearsalArms } }
+      : { 'inventory.json': report.pairs, 'matched-pairs.json': report.scenarios }),
     'provenance.json': { ...report.provenance, analysisGitRevision, analysisTimestamp }
   };
   for (const [name, value] of Object.entries(artifacts)) write(name, JSON.stringify(value, null, 2) + '\n');
@@ -418,7 +440,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     }
     const report = analyzeWorkflowCollection(directory);
     if (command === 'audit') console.log(JSON.stringify(report.audit, null, 2));
-    if (command === 'inspect') console.log(JSON.stringify({ provenance: report.provenance, inventory: report.pairs }, null, 2));
+    if (command === 'inspect') console.log(JSON.stringify({ provenance: report.provenance, inventory: report.rehearsalArms ?? report.pairs }, null, 2));
     if (command === 'report') {
       const git = await promisify(execFile)('git', ['rev-parse', 'HEAD'], {
         cwd: fileURLToPath(new URL('../../', import.meta.url)), encoding: 'utf8'
